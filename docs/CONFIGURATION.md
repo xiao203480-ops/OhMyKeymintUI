@@ -350,6 +350,13 @@ this device:
 - a field the profile does not carry falls back to that field's local source
   and logs a warning; it never falls back to a random value.
 
+Key blobs are bound to the boot state they were created in. Changing
+`security_patch`, `os_patchlevel`, `vendor_patchlevel`, `boot_patchlevel`,
+`vb_key`, or `vb_hash` therefore has the same effect as an OS update: keys
+created under the previous boot state can no longer be decrypted. Keymint
+replaces its boot-level key automatically and keeps running; the affected keys
+are gone, so the apps that owned them must create new ones.
+
 Resolution writes the properties a verifier reads, using the same
 write-and-verify path as an explicit value: `vb_key` and `vb_hash` update
 `ro.boot.vbmeta.public_key_digest` and `ro.boot.vbmeta.digest`,
@@ -476,6 +483,7 @@ reply on failure.
 | `[trust].security_patch`, `os_patchlevel`, `vendor_patchlevel`, `boot_patchlevel` | Hot-apply as a group when no other `[trust]` field changes; otherwise restart keymint. |
 | `[trust]` fields set to `"remote"` | Restart keymint; the stock profile is fetched at startup and cached on disk. |
 | `[trust].os_version` | Restart keymint. |
+| `[trust].vb_key`, `vb_hash` | Restart keymint. Keys created under the previous verified boot identity can no longer be decrypted and are replaced on next use. |
 | Other `[trust]` fields | Restart keymint. |
 | All `[device]` fields | Restart keymint to rebuild the cached ID snapshot. |
 | `vb_key` or `vb_hash` from `"random"` to `"auto"` | Reboot the whole device. |

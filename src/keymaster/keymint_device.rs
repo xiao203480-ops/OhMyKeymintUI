@@ -319,6 +319,22 @@ impl KeyMintDevice {
         }
     }
 
+    /// Whether the failure means an existing key blob can no longer be
+    /// decrypted, which makes the key replaceable rather than fatal.
+    ///
+    /// Key blobs are bound to the boot state they were created in. An OS or
+    /// patch-level change, or a changed verified boot identity, leaves earlier
+    /// blobs unreadable; the affected keys are gone either way, so the caller
+    /// regenerates them.
+    fn is_unreadable_key_blob(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<Error>(),
+                Some(Error::Km(ErrorCode::INVALID_KEY_BLOB))
+            )
+        })
+    }
+
     /// This does the lookup and store in separate transactions; caller must
     /// hold a lock before calling.
     pub fn lookup_or_generate_key<F>(
@@ -355,29 +371,43 @@ impl KeyMintDevice {
                 });
 
             if let Some(key_blob_vec) = key_blob {
-                let (key_characteristics, key_blob) = self
-                    .upgrade_keyblob_if_required_with(
-                        db,
-                        &key_id_guard,
-                        KeyBlob::NonSensitive(key_blob_vec),
-                        |key_blob| {
-                            map_km_error({
-                                let _wp = wd::watch(concat!(
-                                    "KeyMintDevice::lookup_or_generate_key: ",
-                                    "calling IKeyMintDevice::getKeyCharacteristics."
-                                ));
-                                self.km_dev.getKeyCharacteristics(key_blob, &[], &[])
-                            })
-                        },
-                    )
-                    .context(err!("calling getKeyCharacteristics"))?;
+                match self.upgrade_keyblob_if_required_with(
+                    db,
+                    &key_id_guard,
+                    KeyBlob::NonSensitive(key_blob_vec),
+                    |key_blob| {
+                        map_km_error({
+                            let _wp = wd::watch(concat!(
+                                "KeyMintDevice::lookup_or_generate_key: ",
+                                "calling IKeyMintDevice::getKeyCharacteristics."
+                            ));
+                            self.km_dev.getKeyCharacteristics(key_blob, &[], &[])
+                        })
+                    },
+                ) {
+                    Ok((key_characteristics, key_blob)) => {
+                        if validate_characteristics(&key_characteristics) {
+                            return Ok((key_id_guard, key_blob));
+                        }
 
-                if validate_characteristics(&key_characteristics) {
-                    return Ok((key_id_guard, key_blob));
+                        // If this point is reached the existing key is considered outdated or
+                        // corrupted in some way. It will be replaced with a new key below.
+                    }
+                    // A blob the KeyMint instance can no longer decrypt was created for a
+                    // different boot state: the verified boot identity or the patch levels it
+                    // was bound to have changed, exactly as an OS update would change them.
+                    // Such a key can never be used again, so it is replaced below instead of
+                    // failing the request, which for the boot-level key would keep the whole
+                    // daemon from starting.
+                    Err(error) if is_unreadable_key_blob(&error) => {
+                        warn!(
+                            "existing key blob cannot be read at the current boot state; replacing it: {error:#}"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(error).context(err!("calling getKeyCharacteristics"))
+                    }
                 }
-
-                // If this point is reached the existing key is considered outdated or corrupted
-                // in some way. It will be replaced with a new key below.
             };
         }
 
