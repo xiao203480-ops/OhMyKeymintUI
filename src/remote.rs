@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -30,9 +31,13 @@ pub const OP_GENERATE_KEY: &str = "generate_key";
 pub const OP_GET_CHAIN: &str = "get_chain";
 pub const OP_GENERATE_KEY_AND_CHAIN: &str = "generate_key_and_chain";
 pub const OP_SIGN: &str = "sign";
+/// Generic AndroidKeyStore operation (sign/verify/mac/encrypt/decrypt) with
+/// explicit purpose, digest, block mode, padding and nonce.
+pub const OP_OPERATION: &str = "operation";
 pub const OP_VERIFY: &str = "verify";
 pub const OP_DELETE: &str = "delete";
 pub const OP_EXISTS: &str = "exists";
+pub const OP_DEVICE_PROFILE: &str = "device_profile";
 
 /// Failure classes mapped onto OMK routing invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +303,198 @@ fn execute_legacy(
         std::thread::sleep(Duration::from_millis(poll_interval_ms.max(100)));
     }
     Err(RemoteErrorKind::Unavailable) // timed out waiting for a worker
+}
+
+/// Property and boot-state values reported by the stock device, either by the
+/// relay worker itself (live properties) or derived from a genuine stock
+/// attestation chain on the relay server.
+///
+/// The relay path exists because the values a verifier compares against are
+/// the *stock* device's: a rooted host that forwards attestation must expose
+/// the same patch levels and verified-boot identity, or a strict verifier sees
+/// the mismatch between the forwarded chain and the local device.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteDeviceProfile {
+    /// `ro.build.version.security_patch`, e.g. `2026-06-01`.
+    pub security_patch: Option<String>,
+    /// `ro.vendor.build.security_patch`.
+    pub vendor_patch: Option<String>,
+    /// `ro.vendor.boot_security_patch`.
+    pub boot_patch: Option<String>,
+    /// `ro.boot.vbmeta.digest` (32 bytes).
+    pub vbmeta_digest: Option<[u8; 32]>,
+    /// `ro.boot.vbmeta.public_key_digest` (32 bytes).
+    pub vbmeta_key_digest: Option<[u8; 32]>,
+    /// `ro.boot.verifiedbootstate` (`green`, `yellow`, `orange`).
+    pub verified_boot_state: Option<String>,
+    /// `ro.boot.flash.locked` (`1` when the bootloader is locked).
+    pub flash_locked: Option<String>,
+    /// `ro.build.fingerprint`.
+    pub fingerprint: Option<String>,
+}
+
+impl RemoteDeviceProfile {
+    fn from_json(value: &Value) -> Self {
+        fn text(value: &Value, key: &str) -> Option<String> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }
+        fn digest(value: &Value, key: &str) -> Option<[u8; 32]> {
+            let raw = text(value, key)?;
+            let decoded = hex::decode(raw.trim_start_matches("0x")).ok()?;
+            decoded.try_into().ok()
+        }
+        let profile = value.get("profile").unwrap_or(value);
+        Self {
+            security_patch: text(profile, "securityPatch"),
+            vendor_patch: text(profile, "vendorPatch"),
+            boot_patch: text(profile, "bootPatch"),
+            vbmeta_digest: digest(profile, "vbmetaDigest"),
+            vbmeta_key_digest: digest(profile, "vbmetaKeyDigest"),
+            verified_boot_state: text(profile, "verifiedBootState"),
+            flash_locked: text(profile, "flashLocked"),
+            fingerprint: text(profile, "fingerprint"),
+        }
+    }
+
+    /// Whether the bootloader-locked state is reported as locked.
+    pub fn bootloader_locked(&self) -> Option<bool> {
+        self.flash_locked
+            .as_deref()
+            .map(|value| matches!(value, "1" | "true" | "yes"))
+    }
+
+    /// Whether the verified boot state is `green`.
+    pub fn verified_boot_green(&self) -> Option<bool> {
+        self.verified_boot_state
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("green"))
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Cache file so boot-time alignment still works when the worker is offline.
+const PROFILE_CACHE_FILE: &str = "/data/misc/keystore/omk/data/remote_profile.json";
+
+/// How long a fetched profile is reused before another relay round trip.
+const PROFILE_TTL: Duration = Duration::from_secs(600);
+
+static PROFILE_CACHE: OnceLock<Mutex<Option<(Instant, RemoteDeviceProfile)>>> = OnceLock::new();
+
+fn profile_cache() -> &'static Mutex<Option<(Instant, RemoteDeviceProfile)>> {
+    PROFILE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Last successfully fetched profile, without touching the network.
+pub fn cached_device_profile() -> Option<RemoteDeviceProfile> {
+    let guard = profile_cache().lock().ok()?;
+    guard.as_ref().map(|(_, profile)| profile.clone())
+}
+
+fn store_device_profile(profile: &RemoteDeviceProfile) {
+    if let Ok(mut guard) = profile_cache().lock() {
+        *guard = Some((Instant::now(), profile.clone()));
+    }
+    if let Some(parent) = std::path::Path::new(PROFILE_CACHE_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let raw = json!({
+        "securityPatch": profile.security_patch,
+        "vendorPatch": profile.vendor_patch,
+        "bootPatch": profile.boot_patch,
+        "vbmetaDigest": profile.vbmeta_digest.map(hex::encode),
+        "vbmetaKeyDigest": profile.vbmeta_key_digest.map(hex::encode),
+        "verifiedBootState": profile.verified_boot_state,
+        "flashLocked": profile.flash_locked,
+        "fingerprint": profile.fingerprint,
+    });
+    let _ = std::fs::write(PROFILE_CACHE_FILE, raw.to_string());
+}
+
+fn load_cached_device_profile_file() -> Option<RemoteDeviceProfile> {
+    let raw = std::fs::read_to_string(PROFILE_CACHE_FILE).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let profile = RemoteDeviceProfile::from_json(&value);
+    (!profile.is_empty()).then_some(profile)
+}
+
+/// Fetch the stock device profile from the relay.
+///
+/// Uses the in-memory cache while it is fresh, then the on-disk cache when the
+/// relay is unreachable, so a restart without a live worker keeps the last
+/// known alignment instead of silently reverting to the host's own values.
+pub fn device_profile(
+    server: &str,
+    token: &str,
+    timeout_ms: u64,
+) -> Result<RemoteDeviceProfile, RemoteErrorKind> {
+    if let Ok(guard) = profile_cache().lock() {
+        if let Some((fetched_at, profile)) = guard.as_ref() {
+            if fetched_at.elapsed() < PROFILE_TTL {
+                return Ok(profile.clone());
+            }
+        }
+    }
+
+    let query = format!("/relay/device_profile?token={token}");
+    let fetched = (|| -> Result<RemoteDeviceProfile, RemoteErrorKind> {
+        let (code, reply) = relay_request(
+            server,
+            "GET",
+            &query,
+            None,
+            Duration::from_millis(timeout_ms.clamp(2_000, 15_000)),
+        )
+        .map_err(|error| {
+            log::warn!("event=route device profile transport failed: {error:#}");
+            RemoteErrorKind::Unavailable
+        })?;
+        if code != 200 {
+            log::warn!("event=route device profile rejected with HTTP {code}");
+            return Err(RemoteErrorKind::Unavailable);
+        }
+        let profile = RemoteDeviceProfile::from_json(&reply);
+        if profile.is_empty() {
+            return Err(RemoteErrorKind::Protocol(
+                "relay device profile is empty".to_string(),
+            ));
+        }
+        Ok(profile)
+    })();
+
+    match fetched {
+        Ok(profile) => {
+            store_device_profile(&profile);
+            log::info!(
+                "event=route device profile fetched security_patch={} vbmeta_digest={} vbmeta_key_digest={}",
+                profile.security_patch.as_deref().unwrap_or("<none>"),
+                profile
+                    .vbmeta_digest
+                    .map(hex::encode)
+                    .unwrap_or_else(|| "<none>".to_string()),
+                profile
+                    .vbmeta_key_digest
+                    .map(hex::encode)
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+            Ok(profile)
+        }
+        Err(error) => match load_cached_device_profile_file() {
+            Some(profile) => {
+                log::warn!("event=route device profile unavailable ({error}); using cached profile");
+                store_device_profile(&profile);
+                Ok(profile)
+            }
+            None => Err(error),
+        },
+    }
 }
 
 #[cfg(test)]

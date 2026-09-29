@@ -237,7 +237,8 @@ This controls `ro.build.version.security_patch`. It accepts:
 - `"auto"`: use the current `ro.build.version.security_patch` value without
   writing it;
 - `"latest"`: use the fifth day of the current calendar month when the value
-  is resolved; or
+  is resolved;
+- `"remote"`: use the value the stock device reports through the relay; or
 - an actual date written as `"YYYY-MM-DD"`, including leading zeroes.
 
 `"auto"` first uses a nonempty runtime property, then the exact key from the
@@ -252,8 +253,8 @@ the system-provided value.
 #### `os_patchlevel`
 
 This controls the KeyMint OS patch level. `"auto"` follows the effective
-`security_patch`; `"latest"` and an exact `"YYYY-MM-DD"` date override it for
-KeyMint without writing another property. The final value is parsed with the
+`security_patch`; `"latest"`, `"remote"`, and an exact `"YYYY-MM-DD"` date
+override it for KeyMint without writing another property. The final value is parsed with the
 AOSP `YYYY-MM-DD` parser and encoded as `YYYYMM`.
 
 #### `vendor_patchlevel`
@@ -261,10 +262,14 @@ AOSP `YYYY-MM-DD` parser and encoded as `YYYYMM`.
 This controls the KeyMint vendor patch level. `"auto"` first reads the nonempty
 runtime `ro.vendor.build.security_patch`, then the exact key from the standard
 `build.prop` locations, and finally falls back to the effective
-`os_patchlevel`. `"latest"` and an exact `"YYYY-MM-DD"` date are also accepted.
-The final value is parsed with the AOSP `YYYY-MM-DD` parser and encoded as
-`YYYYMMDD`. A present nonempty source is not replaced by a lower-priority source
-merely because parsing later fails. OMK does not write the vendor property.
+`os_patchlevel`. `"latest"`, `"remote"`, and an exact `"YYYY-MM-DD"` date are
+also accepted. The final value is parsed with the AOSP `YYYY-MM-DD` parser and
+encoded as `YYYYMMDD`. A present nonempty source is not replaced by a
+lower-priority source merely because parsing later fails. An explicit or
+`"remote"` value also updates the existing runtime
+`ro.vendor.build.security_patch` property when it differs, so a verifier that
+compares the forwarded chain against local properties sees the same release.
+OMK never creates or deletes the property.
 
 #### `boot_patchlevel`
 
@@ -279,11 +284,12 @@ fails, OMK uses this fallback order: nonempty runtime
 `ro.vendor.boot_security_patch`, the exact key from the standard `build.prop`
 locations, then the effective `os_patchlevel`.
 
-`"latest"`, an exact `"YYYY-MM-DD"` date, and a decimal `u32` wire value are
-also accepted. The decimal form preserves bootloader wire values such as
-`"20000000"` without interpreting them as dates. These explicit modes do not
-read boot metadata. Boot patch-level resolution does not read the system TEE or
-write the boot property. During hot reload, an unchanged `"auto"` keeps the
+`"latest"`, `"remote"`, an exact `"YYYY-MM-DD"` date, and a decimal `u32` wire
+value are also accepted. The decimal form preserves bootloader wire values such
+as `"20000000"` without interpreting them as dates. These explicit modes do not
+read boot metadata. Boot patch-level resolution does not read the system TEE; an
+explicit or `"remote"` value updates the existing runtime
+`ro.vendor.boot_security_patch` property when it differs and never creates it. During hot reload, an unchanged `"auto"` keeps the
 value resolved before keymint dropped privileges; switching from an override
 back to `"auto"` takes effect after keymint restarts. Explicit dates are encoded
 as `YYYYMMDD`.
@@ -303,7 +309,9 @@ This controls the 32-byte verified-boot public-key digest:
 - `"auto"` first reads `ro.boot.vbmeta.public_key_digest`, then tries to
   calculate the top-level vbmeta key digest, and uses a random fallback only if
   neither source is available;
-- `"random"` generates a new value whenever keymint starts; or
+- `"random"` generates a new value whenever keymint starts;
+- `"remote"` uses the verified-boot key digest claimed by the stock device's
+  genuine attestation chain; or
 - a 64-character hexadecimal string pins an exact value.
 
 Keep `"auto"` unless you understand the attestation profile being configured.
@@ -318,12 +326,39 @@ This controls the 32-byte verified-boot hash:
 - `"auto"` first reads `ro.boot.vbmeta.digest`, then tries the original System
   attestation hash, and uses a random fallback only if neither source is
   available;
-- `"random"` generates a new value whenever keymint starts; or
+- `"random"` generates a new value whenever keymint starts;
+- `"remote"` uses the verified-boot hash claimed by the stock device's genuine
+  attestation chain; or
 - a 64-character hexadecimal string pins an exact value.
 
 The same restart rule applies as for `vb_key`: restart keymint after a normal
 change, and reboot the whole device when returning from `"random"` to
 `"auto"`.
+
+#### Remote alignment
+
+Each field above also accepts `"remote"`, which resolves it from the stock
+device profile served by the relay at `/relay/device_profile` instead of from
+this device:
+
+- patch levels and the verified-boot identity come from the newest verified
+  stock attestation chain, or from the live properties the stock worker
+  reports; a live property wins when both are present;
+- the profile is cached in `/data/misc/keystore/omk/data/remote_profile.json`
+  and reused when the relay or the worker is offline, so a restart does not
+  silently revert to this device's values;
+- a field the profile does not carry falls back to that field's local source
+  and logs a warning; it never falls back to a random value.
+
+Resolution writes the properties a verifier reads, using the same
+write-and-verify path as an explicit value: `vb_key` and `vb_hash` update
+`ro.boot.vbmeta.public_key_digest` and `ro.boot.vbmeta.digest`,
+`security_patch` updates `ro.build.version.security_patch`, and an explicit or
+`"remote"` `vendor_patchlevel` or `boot_patchlevel` updates
+`ro.vendor.build.security_patch` or `ro.vendor.boot_security_patch`. OMK never
+creates a missing property, and it never rewrites the build fingerprint or the
+product identity: those still describe this device, so keymint only logs a
+warning when they differ from the stock device.
 
 #### `verified_boot_state`
 
@@ -439,6 +474,7 @@ reply on failure.
 | `[main].force_skip_system_biometric_hat_verification` | Applies to new checks after a valid save. |
 | All `[crypto]` fields | Restart keymint; changing values can make keys unusable. |
 | `[trust].security_patch`, `os_patchlevel`, `vendor_patchlevel`, `boot_patchlevel` | Hot-apply as a group when no other `[trust]` field changes; otherwise restart keymint. |
+| `[trust]` fields set to `"remote"` | Restart keymint; the stock profile is fetched at startup and cached on disk. |
 | `[trust].os_version` | Restart keymint. |
 | Other `[trust]` fields | Restart keymint. |
 | All `[device]` fields | Restart keymint to rebuild the cached ID snapshot. |

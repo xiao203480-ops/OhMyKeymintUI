@@ -441,7 +441,8 @@ fn reload_runtime_config(trigger: WatchTrigger) {
             }
             trust_to_resolve.boot_patchlevel = previous_trust.boot_patchlevel.clone();
         }
-        match crate::plat::vbmeta::resolve_patch_levels(&trust_to_resolve) {
+        let cached_profile = crate::remote::cached_device_profile();
+        match crate::plat::vbmeta::resolve_patch_levels(&trust_to_resolve, cached_profile.as_ref()) {
             Ok(patches) => {
                 update_patchlevels = previous_trust.os_patchlevel != patches.os_patchlevel
                     || previous_trust.vendor_patchlevel != patches.vendor_patchlevel
@@ -512,16 +513,16 @@ fn validate_trust_config(trust: &RawTrustConfig) -> Result<()> {
 
 fn validate_patchlevel(field: &str, value: &str) -> Result<()> {
     let normalized = value.trim();
-    if matches!(normalized, "auto" | "latest")
+    if matches!(normalized, "auto" | "latest" | "remote")
         || is_security_patch_date(normalized)
         || (field == "boot_patchlevel" && normalized.parse::<u32>().is_ok())
     {
         Ok(())
     } else {
         let formats = if field == "boot_patchlevel" {
-            "auto, latest, YYYY-MM-DD, or a decimal u32"
+            "auto, latest, remote, YYYY-MM-DD, or a decimal u32"
         } else {
-            "auto, latest, or YYYY-MM-DD"
+            "auto, latest, remote, or YYYY-MM-DD"
         };
         Err(anyhow!("trust.{field} must be {formats}"))
     }
@@ -819,6 +820,28 @@ pub struct RawTrustConfig {
     pub device_locked: bool,
 }
 
+impl RawTrustConfig {
+    /// Whether any trust value is meant to come from the stock device
+    /// through the relay rather than from this device.
+    pub fn uses_remote_profile(&self) -> bool {
+        self.vb_key == TrustValueSpec::Remote
+            || self.vb_hash == TrustValueSpec::Remote
+            || self
+                .security_patch
+                .trim()
+                .eq_ignore_ascii_case("remote")
+            || self.os_patchlevel.trim().eq_ignore_ascii_case("remote")
+            || self
+                .vendor_patchlevel
+                .trim()
+                .eq_ignore_ascii_case("remote")
+            || self
+                .boot_patchlevel
+                .trim()
+                .eq_ignore_ascii_case("remote")
+    }
+}
+
 impl Default for RawTrustConfig {
     fn default() -> Self {
         Self {
@@ -880,6 +903,8 @@ pub enum TrustValueSpec {
     #[default]
     Auto,
     Random,
+    /// Use the value reported by the stock device through the relay.
+    Remote,
     Hex([u8; 32]),
 }
 
@@ -891,6 +916,7 @@ impl Serialize for TrustValueSpec {
         match self {
             TrustValueSpec::Auto => serializer.serialize_str("auto"),
             TrustValueSpec::Random => serializer.serialize_str("random"),
+            TrustValueSpec::Remote => serializer.serialize_str("remote"),
             TrustValueSpec::Hex(bytes) => serializer.serialize_str(&hex::encode(bytes)),
         }
     }
@@ -905,6 +931,7 @@ impl<'de> Deserialize<'de> for TrustValueSpec {
         match raw.trim() {
             "auto" => Ok(TrustValueSpec::Auto),
             "random" => Ok(TrustValueSpec::Random),
+            "remote" => Ok(TrustValueSpec::Remote),
             candidate => {
                 let decoded = hex::decode(candidate).map_err(serde::de::Error::custom)?;
                 if decoded.len() != 32 {
@@ -927,6 +954,8 @@ pub enum TrustValueSource {
     Property,
     Computed,
     Original,
+    /// Reported by the stock device through the relay.
+    Remote,
     RandomExplicit,
     RandomFallback,
 }
@@ -938,6 +967,7 @@ impl std::fmt::Display for TrustValueSource {
             TrustValueSource::Property => write!(f, "property"),
             TrustValueSource::Computed => write!(f, "computed"),
             TrustValueSource::Original => write!(f, "original"),
+            TrustValueSource::Remote => write!(f, "remote"),
             TrustValueSource::RandomExplicit => write!(f, "random_explicit"),
             TrustValueSource::RandomFallback => write!(f, "random_fallback"),
         }

@@ -127,8 +127,9 @@
 //! Either way, we have to revaluate the pruning scores.
 
 use crate::android::hardware::security::keymint::{
-    IKeyMintOperation::IKeyMintOperation, KeyParameter::KeyParameter, KeyPurpose::KeyPurpose,
-    SecurityLevel::SecurityLevel,
+    BlockMode::BlockMode, Digest::Digest, IKeyMintOperation::IKeyMintOperation,
+    KeyParameter::KeyParameter, KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose,
+    PaddingMode::PaddingMode, SecurityLevel::SecurityLevel, Tag::Tag,
 };
 use crate::android::security::metrics::{
     Algorithm::Algorithm as MetricsAlgorithm, OperationType::OperationType,
@@ -178,12 +179,117 @@ pub enum Outcome {
     ErrorCode(SerializedError),
 }
 
-/// V1 relay remote signing state: the operation accumulates input data
+/// V1 relay remote operation state: the operation accumulates input data
 /// locally and forwards it to the stock device's TEE at finish.
 #[derive(Debug)]
 struct RemoteSign {
     alias: String,
     data: Vec<u8>,
+    params: RemoteOperationParams,
+    /// Additional authenticated data supplied through updateAad.
+    aad: Vec<u8>,
+}
+
+/// The operation parameters the stock worker needs to reproduce the exact
+/// request the caller made. A relayed key must behave like the key the caller
+/// asked for, so these are forwarded instead of being assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteOperationParams {
+    /// Worker operation name: sign, verify, encrypt, decrypt, or mac.
+    pub(crate) purpose: &'static str,
+    /// Requested digest: none, sha1, sha256, sha384, or sha512.
+    pub(crate) digest: &'static str,
+    /// Requested block mode for cipher operations.
+    pub(crate) block_mode: Option<&'static str>,
+    /// Requested padding for cipher operations.
+    pub(crate) padding: Option<&'static str>,
+    /// Caller-supplied nonce/IV, base64 encoded.
+    pub(crate) iv_b64: Option<String>,
+}
+
+impl RemoteOperationParams {
+    /// Map a create request onto the worker's operation schema. Returns None
+    /// for purposes the relay cannot reproduce, which keeps those requests on
+    /// the local backend instead of relaying a request the worker cannot run.
+    /// Pure: callers decide whether an unsupported purpose is worth reporting.
+    pub(crate) fn from_params(
+        purpose: KeyPurpose,
+        params: &[KeyParameter],
+    ) -> Option<RemoteOperationParams> {
+        let purpose = match purpose {
+            KeyPurpose::SIGN => "sign",
+            KeyPurpose::VERIFY => "verify",
+            KeyPurpose::ENCRYPT => "encrypt",
+            KeyPurpose::DECRYPT => "decrypt",
+            _ => return None,
+        };
+        let mut digest = "sha256";
+        let mut block_mode = None;
+        let mut padding = None;
+        let mut iv_b64 = None;
+        for param in params {
+            match param.tag {
+                Tag::DIGEST => {
+                    if let KeyParameterValue::Digest(value) = param.value {
+                        digest = digest_name(value);
+                    }
+                }
+                Tag::BLOCK_MODE => {
+                    if let KeyParameterValue::BlockMode(value) = param.value {
+                        block_mode = Some(block_mode_name(value));
+                    }
+                }
+                Tag::ENCRYPTION_PADDING => {
+                    if let KeyParameterValue::PaddingMode(value) = param.value {
+                        padding = Some(padding_name(value));
+                    }
+                }
+                Tag::NONCE => {
+                    if let KeyParameterValue::Blob(bytes) = &param.value {
+                        iv_b64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(RemoteOperationParams {
+            purpose,
+            digest,
+            block_mode,
+            padding,
+            iv_b64,
+        })
+    }
+}
+
+fn digest_name(value: Digest) -> &'static str {
+    match value {
+        Digest::NONE => "none",
+        Digest::SHA1 => "sha1",
+        Digest::SHA_2_384 => "sha384",
+        Digest::SHA_2_512 => "sha512",
+        _ => "sha256",
+    }
+}
+
+fn block_mode_name(value: BlockMode) -> &'static str {
+    match value {
+        BlockMode::CBC => "cbc",
+        BlockMode::CTR => "ctr",
+        BlockMode::ECB => "ecb",
+        _ => "gcm",
+    }
+}
+
+fn padding_name(value: PaddingMode) -> &'static str {
+    match value {
+        PaddingMode::PKCS7 => "pkcs7",
+        PaddingMode::RSA_OAEP => "oaep",
+        PaddingMode::RSA_PKCS1_1_5_ENCRYPT => "pkcs1",
+        PaddingMode::RSA_PKCS1_1_5_SIGN => "pkcs1",
+        PaddingMode::RSA_PSS => "pss",
+        _ => "none",
+    }
 }
 
 /// Operation bundles all of the operation related resources and tracks the operation's
@@ -278,12 +384,14 @@ impl Operation {
         }
     }
 
-    /// Enable V1 relay remote signing for this operation (RemoteBound key).
-    pub fn set_remote_signing(&self, alias: String) {
+    /// Enable V1 relay execution for this operation (RemoteBound key).
+    pub fn set_remote_operation(&self, alias: String, params: RemoteOperationParams) {
         if let Ok(mut remote) = self.remote.lock() {
             *remote = Some(RemoteSign {
                 alias,
                 data: Vec::new(),
+                params,
+                aad: Vec::new(),
             });
         }
     }
@@ -419,6 +527,16 @@ impl Operation {
             .before_update()
             .context(ks_err!("Trying to get auth tokens for {:?}", self.owner))?;
 
+        // V1 relay: the remote AEAD operation must see the same AAD.
+        if let Some(remote) = self
+            .remote
+            .lock()
+            .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))?
+            .as_mut()
+        {
+            remote.aad.extend_from_slice(aad_input);
+        }
+
         self.update_outcome(&mut outcome, {
             let _wp = self.watch("Operation::update_aad: calling IKeyMintOperation::updateAad");
             map_km_error(self.km_op.updateAad(aad_input, hat.as_ref(), tst.as_ref()))
@@ -494,32 +612,79 @@ impl Operation {
                 .read()
                 .map(|cfg| cfg.remote.clone())
                 .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))?;
-            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&remote.data);
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let data_b64 = b64.encode(&remote.data);
+            let purpose = remote.params.purpose;
+            let alias = remote.alias.clone();
+            let mut task = serde_json::json!({
+                "alias": remote.alias,
+                "purpose": purpose,
+                "digest": remote.params.digest,
+                "dataB64": data_b64,
+            });
+            if let Some(value) = remote.params.block_mode {
+                task["blockMode"] = serde_json::Value::from(value);
+            }
+            if let Some(value) = remote.params.padding {
+                task["padding"] = serde_json::Value::from(value);
+            }
+            if let Some(value) = &remote.params.iv_b64 {
+                task["ivB64"] = serde_json::Value::from(value.as_str());
+            }
+            if !remote.aad.is_empty() {
+                task["aadB64"] = serde_json::Value::from(b64.encode(&remote.aad));
+            }
             let result = crate::remote::execute(
                 &rc.server,
                 &rc.token,
-                crate::remote::OP_SIGN,
-                serde_json::json!({
-                    "alias": remote.alias,
-                    "dataB64": data_b64,
-                }),
+                crate::remote::OP_OPERATION,
+                task,
                 rc.timeout_ms,
                 rc.poll_interval_ms,
-            );
+            )
+            .or_else(|error| match error {
+                // A worker that predates the generic operation still
+                // understands the dedicated sign op.
+                crate::remote::RemoteErrorKind::WorkerError(_) if purpose == "sign" => {
+                    log::info!("event=route worker lacks the generic operation; using the sign op");
+                    crate::remote::execute(
+                        &rc.server,
+                        &rc.token,
+                        crate::remote::OP_SIGN,
+                        serde_json::json!({ "alias": alias, "dataB64": data_b64 }),
+                        rc.timeout_ms,
+                        rc.poll_interval_ms,
+                    )
+                }
+                other => Err(other),
+            });
             drop(remote_guard);
             match result {
                 Ok(data) => {
-                    let sig_b64 = data
-                        .get("signatureB64")
+                    if purpose == "verify" {
+                        let valid = data
+                            .get("valid")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if !valid {
+                            return Err(Error::Km(ErrorCode::VERIFICATION_FAILED))
+                                .context(ks_err!("Remote verification failed"));
+                        }
+                        *outcome = Outcome::Success;
+                        return Ok(None);
+                    }
+                    let output_b64 = data
+                        .get("outputB64")
+                        .or_else(|| data.get("signatureB64"))
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| Error::Km(ErrorCode::UNKNOWN_ERROR))
-                        .context(ks_err!("Remote finish missing signature"))?;
-                    let signature_bytes = base64::engine::general_purpose::STANDARD
-                        .decode(sig_b64)
+                        .context(ks_err!("Remote finish returned no output"))?;
+                    let output = b64
+                        .decode(output_b64)
                         .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))
-                        .context(ks_err!("Remote finish bad signature b64"))?;
+                        .context(ks_err!("Remote finish returned invalid base64"))?;
                     *outcome = Outcome::Success;
-                    return Ok(Some(signature_bytes));
+                    return Ok(Some(output));
                 }
                 Err(crate::remote::RemoteErrorKind::Unavailable) => {
                     return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))

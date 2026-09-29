@@ -15,12 +15,13 @@
 //! This crate implements the IKeystoreSecurityLevel interface.
 
 use crate::android::hardware::security::keymint::{
-    Algorithm::Algorithm, AttestationKey::AttestationKey,
-    EcCurve::EcCurve, HardwareAuthenticatorType::HardwareAuthenticatorType,
+    Algorithm::Algorithm, AttestationKey::AttestationKey, BlockMode::BlockMode,
+    Digest::Digest, EcCurve::EcCurve, HardwareAuthenticatorType::HardwareAuthenticatorType,
     IKeyMintDevice::IKeyMintDevice,
     KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyOrigin::KeyOrigin, KeyParameter::KeyParameter,
-    KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
+    KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
+    SecurityLevel::SecurityLevel, Tag::Tag,
 };
 use crate::android::security::metrics::OperationType::OperationType;
 use crate::android::system::keystore2::{
@@ -394,6 +395,11 @@ impl KeystoreSecurityLevel {
             .cloned()
             .collect();
         let operation_parameters = op_params.as_slice();
+        // V1 relay: the exact operation parameters a remote-bound key must be
+        // exercised with. Captured before op_params is moved into the logging
+        // info below.
+        let remote_operation_params =
+            crate::keymaster::operation::RemoteOperationParams::from_params(purpose, &op_params);
 
         let (immediate_hat, mut auth_info) = ENFORCEMENTS
             .authorize_create(
@@ -511,12 +517,22 @@ impl KeystoreSecurityLevel {
         if let Some(ref alias) = remote_bound_alias {
             if let Ok(cfg) = crate::config::config().read() {
                 if cfg.remote.enabled {
-                    operation.set_remote_signing(alias.clone());
-                    log::info!(
-                        "event=route operation remote-bound alias={} uid={}",
-                        alias,
-                        caller_uid.0,
-                    );
+                    match remote_operation_params {
+                        Some(params) => {
+                            operation.set_remote_operation(alias.clone(), params);
+                            log::info!(
+                                "event=route operation remote-bound alias={} uid={} purpose={:?}",
+                                alias,
+                                caller_uid.0,
+                                purpose,
+                            );
+                        }
+                        None => log::warn!(
+                            "event=route remote-bound key used for a purpose the relay cannot run; keeping the local backend alias={} uid={}",
+                            alias,
+                            caller_uid.0,
+                        ),
+                    }
                 }
             }
         }
@@ -790,6 +806,46 @@ impl KeystoreSecurityLevel {
         })
     }
 
+    fn relay_purpose_name(value: KeyPurpose) -> &'static str {
+        match value {
+            KeyPurpose::VERIFY => "verify",
+            KeyPurpose::ENCRYPT => "encrypt",
+            KeyPurpose::DECRYPT => "decrypt",
+            KeyPurpose::WRAP_KEY => "wrap",
+            KeyPurpose::AGREE_KEY => "agree",
+            _ => "sign",
+        }
+    }
+
+    fn relay_digest_name(value: Digest) -> &'static str {
+        match value {
+            Digest::NONE => "none",
+            Digest::SHA1 => "sha1",
+            Digest::SHA_2_384 => "sha384",
+            Digest::SHA_2_512 => "sha512",
+            _ => "sha256",
+        }
+    }
+
+    fn relay_block_mode_name(value: BlockMode) -> &'static str {
+        match value {
+            BlockMode::CBC => "cbc",
+            BlockMode::CTR => "ctr",
+            BlockMode::ECB => "ecb",
+            _ => "gcm",
+        }
+    }
+
+    fn relay_padding_name(value: PaddingMode) -> &'static str {
+        match value {
+            PaddingMode::PKCS7 => "pkcs7",
+            PaddingMode::RSA_OAEP => "oaep",
+            PaddingMode::RSA_PKCS1_1_5_ENCRYPT | PaddingMode::RSA_PKCS1_1_5_SIGN => "pkcs1",
+            PaddingMode::RSA_PSS => "pss",
+            _ => "none",
+        }
+    }
+
     /// V1 relay path: create the key on the stock device's genuine TEE via
     /// the relay server, then store a local RemoteBound entry (local key
     /// material kept only as the keystore backing record) and hand the
@@ -814,27 +870,79 @@ impl KeystoreSecurityLevel {
             format!("omk-remote-{}", caller_uid(ctx).0)
         });
         // 2) map the keystore key parameters onto the relay task schema.
+        // The remote key must be created with the parameters the caller asked
+        // for, otherwise the relayed key behaves differently from the local
+        // backing entry and real clients fail on the second operation.
         let mut algorithm = "ec";
-        let mut key_size = 256u64;
+        let mut key_size = 0u64;
         let mut ec_curve = "p256";
+        let mut purposes: Vec<&str> = Vec::new();
+        let mut digests: Vec<&str> = Vec::new();
+        let mut block_modes: Vec<&str> = Vec::new();
+        let mut paddings: Vec<&str> = Vec::new();
+        let mut user_auth_required = false;
         let mut challenge_b64: Option<String> = None;
         for p in params {
             match p.tag {
                 Tag::ALGORITHM => {
-                    if let KeyParameterValue::Algorithm(Algorithm::RSA) = p.value {
-                        algorithm = "rsa";
-                    } else if let KeyParameterValue::Algorithm(Algorithm::EC) = p.value {
-                        algorithm = "ec";
+                    if let KeyParameterValue::Algorithm(value) = p.value {
+                        algorithm = match value {
+                            Algorithm::RSA => "rsa",
+                            Algorithm::AES => "aes",
+                            Algorithm::HMAC => "hmac",
+                            Algorithm::EC => "ec",
+                            _ => {
+                                log::warn!(
+                                    "event=route remote generate with unsupported algorithm; using EC"
+                                );
+                                "ec"
+                            }
+                        };
                     }
                 }
                 Tag::KEY_SIZE => {
                     if let KeyParameterValue::Integer(size) = p.value {
-                        key_size = size as u64;
+                        key_size = size.max(0) as u64;
                     }
                 }
                 Tag::EC_CURVE => {
-                    if let KeyParameterValue::EcCurve(EcCurve::P_256) = p.value {
-                        ec_curve = "p256";
+                    if let KeyParameterValue::EcCurve(value) = p.value {
+                        ec_curve = match value {
+                            EcCurve::P_384 => "p384",
+                            EcCurve::P_521 => "p521",
+                            EcCurve::P_256 => "p256",
+                            _ => {
+                                log::warn!(
+                                    "event=route remote generate with unsupported curve; using P-256"
+                                );
+                                "p256"
+                            }
+                        };
+                    }
+                }
+                Tag::PURPOSE => {
+                    if let KeyParameterValue::KeyPurpose(value) = p.value {
+                        purposes.push(relay_purpose_name(value));
+                    }
+                }
+                Tag::DIGEST => {
+                    if let KeyParameterValue::Digest(value) = p.value {
+                        digests.push(relay_digest_name(value));
+                    }
+                }
+                Tag::BLOCK_MODE => {
+                    if let KeyParameterValue::BlockMode(value) = p.value {
+                        block_modes.push(relay_block_mode_name(value));
+                    }
+                }
+                Tag::ENCRYPTION_PADDING => {
+                    if let KeyParameterValue::PaddingMode(value) = p.value {
+                        paddings.push(relay_padding_name(value));
+                    }
+                }
+                Tag::USER_AUTH_REQUIRED => {
+                    if let KeyParameterValue::BoolValue(true) = p.value {
+                        user_auth_required = true;
                     }
                 }
                 Tag::ATTESTATION_CHALLENGE => {
@@ -845,13 +953,30 @@ impl KeystoreSecurityLevel {
                 _ => {}
             }
         }
+        if user_auth_required {
+            log::warn!(
+                "event=route remote generate requested a user-auth-bound key; the stock worker cannot satisfy remote user authentication, so the relayed key is created without it"
+            );
+        }
+        let key_size = if key_size == 0 {
+            match algorithm {
+                "rsa" => 2048,
+                "aes" | "hmac" => 256,
+                _ => 256,
+            }
+        } else {
+            key_size
+        };
         let task_params = serde_json::json!({
             "alias": alias,
             "algorithm": algorithm,
-            "purposes": ["sign"],
-            "digests": ["sha256"],
+            "purposes": purposes,
+            "digests": digests,
             "keySize": key_size,
             "ecCurve": ec_curve,
+            "blockModes": block_modes,
+            "paddings": paddings,
+            "userAuthRequired": false,
             "attestChallengeB64": challenge_b64,
         });
         // 3) remote generate + fetch the genuine chain in one round trip;

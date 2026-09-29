@@ -73,12 +73,17 @@ pub(crate) struct ResolvedPatchLevels {
     pub vendor_patchlevel: String,
     pub boot_patchlevel: String,
     pub observed_security_patch: Option<String>,
+    pub observed_vendor_patch: Option<String>,
+    pub observed_boot_patch: Option<String>,
     pub write_security_patch: bool,
+    pub write_vendor_patch: bool,
+    pub write_boot_patch: bool,
 }
 
 pub fn bootstrap_vbmeta(config_file: &ConfigFile) -> Result<ResolvedTrust> {
     let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
-    let patches = resolve_patch_levels(&config_file.trust)?;
+    let remote_profile = remote_device_profile(&config_file.trust, &config_file.remote);
+    let patches = resolve_patch_levels(&config_file.trust, remote_profile.as_ref())?;
     let os_version = match config_file.trust.os_version {
         OsVersionSpec::Auto => kmr_common::android_version::android_major_version().unwrap_or(16),
         OsVersionSpec::Fixed(value) => value,
@@ -88,18 +93,13 @@ pub fn bootstrap_vbmeta(config_file: &ConfigFile) -> Result<ResolvedTrust> {
         &config_file.trust.vb_key,
         config_file.trust.device_locked,
         &slot_suffix,
+        remote_profile.as_ref(),
     );
-    let vb_hash = resolve_vb_hash(&config_file.trust.vb_hash);
+    let vb_hash = resolve_vb_hash(&config_file.trust.vb_hash, remote_profile.as_ref());
 
     sync_sysprops_if_needed(&vb_key, &vb_hash)?;
-    if patches.write_security_patch {
-        write_security_patch_with_rollback(
-            resetprop::direct_write_and_verify_property,
-            resetprop::read_string_property,
-            &patches.security_patch,
-            patches.observed_security_patch.as_deref(),
-        )?;
-    }
+    sync_patch_props(&patches)?;
+    report_identity_mismatches(remote_profile.as_ref());
 
     let vb_key_hex = hex::encode(vb_key.value);
     let vb_hash_hex = hex::encode(vb_hash.value);
@@ -127,68 +127,198 @@ pub fn bootstrap_vbmeta(config_file: &ConfigFile) -> Result<ResolvedTrust> {
 }
 
 pub(crate) fn write_runtime_security_patch(desired: &str, previous: Option<&str>) -> Result<()> {
-    write_security_patch_with_rollback(
+    write_prop_with_rollback(
         resetprop::runtime_write_and_verify_property,
         resetprop::read_string_property,
+        SECURITY_PATCH_PROP,
         desired,
         previous,
     )
 }
 
-fn resolve_vb_key(spec: &TrustValueSpec, device_locked: bool, slot_suffix: &str) -> ResolvedField {
-    match spec {
-        TrustValueSpec::Hex(value) => ResolvedField {
-            value: *value,
-            source: TrustValueSource::ExplicitHex,
-        },
-        TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
-        TrustValueSpec::Auto => {
-            if let Some(value) = read_hex_property(VBMETA_KEY_PROP) {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
-            }
-
-            match compute_vbmeta_public_key_digest(slot_suffix, device_locked) {
-                Ok(value) => ResolvedField {
-                    value,
-                    source: TrustValueSource::Computed,
-                },
-                Err(error) => {
-                    log::warn!("computed vbmeta public key digest unavailable: {error:#}");
-                    random_field(TrustValueSource::RandomFallback)
-                }
-            }
+/// Fetch the stock device profile when the trust config asks for remote
+/// values. Any failure degrades to the local value sources, so a relay outage
+/// never blocks daemon startup.
+fn remote_device_profile(
+    trust: &RawTrustConfig,
+    remote: &crate::config::RemoteConfig,
+) -> Option<crate::remote::RemoteDeviceProfile> {
+    if !trust.uses_remote_profile() {
+        return None;
+    }
+    if !remote.enabled {
+        log::warn!(
+            "trust values request the stock device profile, but [remote] is disabled; using local value sources"
+        );
+        return None;
+    }
+    match crate::remote::device_profile(&remote.server, &remote.token, remote.timeout_ms) {
+        Ok(profile) => Some(profile),
+        Err(error) => {
+            log::warn!(
+                "failed to fetch the stock device profile ({error}); using local value sources"
+            );
+            None
         }
     }
 }
 
-fn resolve_vb_hash(spec: &TrustValueSpec) -> ResolvedField {
+/// Log the identity values that still differ from the stock device.
+///
+/// Patch levels and the verified boot identity are aligned by the trust
+/// configuration, while the build identity describes this device and is
+/// reported only: rewriting it would change every app's view of the device.
+fn report_identity_mismatches(profile: Option<&crate::remote::RemoteDeviceProfile>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    let Some(remote_fingerprint) = profile.fingerprint.as_deref() else {
+        return;
+    };
+    let local_fingerprint = resetprop::read_string_property("ro.build.fingerprint").unwrap_or_default();
+    if !local_fingerprint.is_empty() && local_fingerprint != remote_fingerprint {
+        log::warn!(
+            "event=align build identity differs from the stock device: local={local_fingerprint} stock={remote_fingerprint}"
+        );
+    }
+}
+
+/// Align every patch-level property a verifier can read with the values the
+/// configured trust values claim.
+///
+/// The main security patch property has its own writer because the TEE patch
+/// levels derive from it; the vendor and boot patch properties are aligned
+/// here so a strict verifier comparing the forwarded chain against local
+/// properties does not see a stale release.
+fn sync_patch_props(patches: &ResolvedPatchLevels) -> Result<()> {
+    if patches.write_security_patch {
+        write_prop_with_rollback(
+            resetprop::direct_write_and_verify_property,
+            resetprop::read_string_property,
+            SECURITY_PATCH_PROP,
+            &patches.security_patch,
+            patches.observed_security_patch.as_deref(),
+        )?;
+    }
+    for (property, desired, observed) in [
+        (
+            VENDOR_PATCH_PROP,
+            patches.vendor_patchlevel.as_str(),
+            patches.observed_vendor_patch.as_deref(),
+        ),
+        (
+            BOOT_PATCH_PROP,
+            patches.boot_patchlevel.as_str(),
+            patches.observed_boot_patch.as_deref(),
+        ),
+    ] {
+        let should_write = match property {
+            VENDOR_PATCH_PROP => patches.write_vendor_patch,
+            _ => patches.write_boot_patch,
+        };
+        if !should_write {
+            continue;
+        }
+        write_prop_with_rollback(
+            resetprop::direct_write_and_verify_property,
+            resetprop::read_string_property,
+            property,
+            desired,
+            observed,
+        )
+        .with_context(|| format!("failed to align {property}"))?;
+    }
+    Ok(())
+}
+
+fn resolve_vb_key(
+    spec: &TrustValueSpec,
+    device_locked: bool,
+    slot_suffix: &str,
+    remote: Option<&crate::remote::RemoteDeviceProfile>,
+) -> ResolvedField {
     match spec {
         TrustValueSpec::Hex(value) => ResolvedField {
             value: *value,
             source: TrustValueSource::ExplicitHex,
         },
         TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
-        TrustValueSpec::Auto => {
-            if let Some(value) = read_hex_property(VBMETA_HASH_PROP) {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
+        TrustValueSpec::Remote => match remote.and_then(|profile| profile.vbmeta_key_digest) {
+            Some(value) => ResolvedField {
+                value,
+                source: TrustValueSource::Remote,
+            },
+            None => {
+                log::warn!(
+                    "stock device profile has no vbmeta public key digest; using the local value"
+                );
+                resolve_vb_key_auto(device_locked, slot_suffix)
             }
+        },
+        TrustValueSpec::Auto => resolve_vb_key_auto(device_locked, slot_suffix),
+    }
+}
 
-            match probe_original_verified_boot_hash_with_timeout(ORIGINAL_HASH_TIMEOUT) {
-                Ok(value) => ResolvedField {
-                    value,
-                    source: TrustValueSource::Original,
-                },
-                Err(error) => {
-                    log::warn!("original verified boot hash unavailable: {error:#}");
-                    random_field(TrustValueSource::RandomFallback)
-                }
+fn resolve_vb_key_auto(device_locked: bool, slot_suffix: &str) -> ResolvedField {
+    if let Some(value) = read_hex_property(VBMETA_KEY_PROP) {
+        return ResolvedField {
+            value,
+            source: TrustValueSource::Property,
+        };
+    }
+
+    match compute_vbmeta_public_key_digest(slot_suffix, device_locked) {
+        Ok(value) => ResolvedField {
+            value,
+            source: TrustValueSource::Computed,
+        },
+        Err(error) => {
+            log::warn!("computed vbmeta public key digest unavailable: {error:#}");
+            random_field(TrustValueSource::RandomFallback)
+        }
+    }
+}
+
+fn resolve_vb_hash(
+    spec: &TrustValueSpec,
+    remote: Option<&crate::remote::RemoteDeviceProfile>,
+) -> ResolvedField {
+    match spec {
+        TrustValueSpec::Hex(value) => ResolvedField {
+            value: *value,
+            source: TrustValueSource::ExplicitHex,
+        },
+        TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
+        TrustValueSpec::Remote => match remote.and_then(|profile| profile.vbmeta_digest) {
+            Some(value) => ResolvedField {
+                value,
+                source: TrustValueSource::Remote,
+            },
+            None => {
+                log::warn!("stock device profile has no vbmeta digest; using the local value");
+                resolve_vb_hash_auto()
             }
+        },
+        TrustValueSpec::Auto => resolve_vb_hash_auto(),
+    }
+}
+
+fn resolve_vb_hash_auto() -> ResolvedField {
+    if let Some(value) = read_hex_property(VBMETA_HASH_PROP) {
+        return ResolvedField {
+            value,
+            source: TrustValueSource::Property,
+        };
+    }
+
+    match probe_original_verified_boot_hash_with_timeout(ORIGINAL_HASH_TIMEOUT) {
+        Ok(value) => ResolvedField {
+            value,
+            source: TrustValueSource::Original,
+        },
+        Err(error) => {
+            log::warn!("original verified boot hash unavailable: {error:#}");
+            random_field(TrustValueSource::RandomFallback)
         }
     }
 }
@@ -200,7 +330,10 @@ fn random_field(source: TrustValueSource) -> ResolvedField {
     ResolvedField { value, source }
 }
 
-pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPatchLevels> {
+pub(crate) fn resolve_patch_levels(
+    trust: &RawTrustConfig,
+    remote: Option<&crate::remote::RemoteDeviceProfile>,
+) -> Result<ResolvedPatchLevels> {
     let observed_security_patch = resetprop::read_string_property(SECURITY_PATCH_PROP);
     let security_patch = observed_security_patch
         .clone()
@@ -244,6 +377,7 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
         boot_patch.as_deref(),
         observed_security_patch.as_deref(),
         latest.as_deref(),
+        remote,
     )
 }
 
@@ -254,15 +388,22 @@ fn resolve_patch_levels_from(
     boot_property: Option<&str>,
     observed_security_property: Option<&str>,
     latest: Option<&str>,
+    remote: Option<&crate::remote::RemoteDeviceProfile>,
 ) -> Result<ResolvedPatchLevels> {
     let security_auto = security_property.unwrap_or(SECURITY_PATCH_FALLBACK);
-    let security_patch =
-        resolve_security_patch_value(&trust.security_patch, security_auto, latest)?;
+    let remote_security_patch = remote.and_then(|profile| profile.security_patch.as_deref());
+    let security_patch = resolve_security_patch_value(
+        &trust.security_patch,
+        security_auto,
+        latest,
+        remote_security_patch,
+    )?;
     let os_patchlevel = resolve_patchlevel_mode(
         "os_patchlevel",
         &trust.os_patchlevel,
         &security_patch,
         latest,
+        remote_security_patch,
     )?;
     let vendor_auto = vendor_property.unwrap_or(&os_patchlevel);
     let vendor_patchlevel = resolve_patchlevel_mode(
@@ -270,13 +411,25 @@ fn resolve_patch_levels_from(
         &trust.vendor_patchlevel,
         vendor_auto,
         latest,
+        remote.and_then(|profile| profile.vendor_patch.as_deref()),
     )?;
     let boot_auto = boot_property.unwrap_or(&os_patchlevel);
-    let boot_patchlevel =
-        resolve_patchlevel_mode("boot_patchlevel", &trust.boot_patchlevel, boot_auto, latest)?;
+    let boot_patchlevel = resolve_patchlevel_mode(
+        "boot_patchlevel",
+        &trust.boot_patchlevel,
+        boot_auto,
+        latest,
+        remote.and_then(|profile| profile.boot_patch.as_deref()),
+    )?;
     let write_security_patch = observed_security_property.is_some()
-        && trust.security_patch.trim() != "auto"
+        && explicit_patch_mode(&trust.security_patch)
         && observed_security_property != Some(security_patch.as_str());
+    let write_vendor_patch = vendor_property.is_some()
+        && explicit_patch_mode(&trust.vendor_patchlevel)
+        && vendor_property != Some(vendor_patchlevel.as_str());
+    let write_boot_patch = boot_property.is_some()
+        && explicit_patch_mode(&trust.boot_patchlevel)
+        && boot_property != Some(boot_patchlevel.as_str());
 
     Ok(ResolvedPatchLevels {
         security_patch,
@@ -284,16 +437,46 @@ fn resolve_patch_levels_from(
         vendor_patchlevel,
         boot_patchlevel,
         observed_security_patch: observed_security_property.map(str::to_string),
+        observed_vendor_patch: vendor_property.map(str::to_string),
+        observed_boot_patch: boot_property.map(str::to_string),
         write_security_patch,
+        write_vendor_patch,
+        write_boot_patch,
     })
 }
 
-fn resolve_security_patch_value(mode: &str, auto: &str, latest: Option<&str>) -> Result<String> {
+/// Whether a patch mode asks for a specific value, either directly or through
+/// the stock device profile, rather than mirroring this device.
+fn explicit_patch_mode(mode: &str) -> bool {
+    !mode.trim().eq_ignore_ascii_case("auto")
+}
+
+/// Resolve a patch mode against the stock profile, falling back to the local
+/// value when the profile does not carry the field.
+fn remote_or_local(remote: Option<&str>, local: &str) -> String {
+    match remote.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.to_string(),
+        None => {
+            log::warn!(
+                "stock device profile lacks this patch level; keeping the local value {local}"
+            );
+            local.to_string()
+        }
+    }
+}
+
+fn resolve_security_patch_value(
+    mode: &str,
+    auto: &str,
+    latest: Option<&str>,
+    remote: Option<&str>,
+) -> Result<String> {
     match mode.trim() {
         "auto" => Ok(auto.to_string()),
         "latest" => latest
             .map(str::to_string)
             .ok_or_else(|| anyhow!("latest value was not resolved for security_patch")),
+        "remote" => Ok(remote_or_local(remote, auto)),
         value if crate::config::is_security_patch_date(value) => Ok(value.to_string()),
         value => Err(anyhow!("invalid security_patch value: {value}")),
     }
@@ -304,12 +487,14 @@ fn resolve_patchlevel_mode(
     mode: &str,
     auto: &str,
     latest: Option<&str>,
+    remote: Option<&str>,
 ) -> Result<String> {
     match mode.trim() {
         "auto" => Ok(auto.to_string()),
         "latest" => latest
             .map(str::to_string)
             .ok_or_else(|| anyhow!("latest value was not resolved for {field}")),
+        "remote" => Ok(remote_or_local(remote, auto)),
         value if !value.is_empty() => Ok(value.to_string()),
         value => Err(anyhow!("invalid {field} value: {value}")),
     }
@@ -340,9 +525,10 @@ fn parse_build_prop_value(contents: &str, key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn write_security_patch_with_rollback<W, R>(
+fn write_prop_with_rollback<W, R>(
     mut writer: W,
     reader: R,
+    property: &str,
     desired: &str,
     previous: Option<&str>,
 ) -> Result<()>
@@ -350,21 +536,19 @@ where
     W: FnMut(&str, &str) -> Result<()>,
     R: Fn(&str) -> Option<String>,
 {
-    let previous = previous
-        .ok_or_else(|| anyhow!("{SECURITY_PATCH_PROP} is missing; refusing to create it"))?;
-    let current = reader(SECURITY_PATCH_PROP)
-        .ok_or_else(|| anyhow!("{SECURITY_PATCH_PROP} disappeared; refusing to create it"))?;
+    let previous =
+        previous.ok_or_else(|| anyhow!("{property} is missing; refusing to create it"))?;
+    let current = reader(property)
+        .ok_or_else(|| anyhow!("{property} disappeared; refusing to create it"))?;
     if current != previous {
-        bail!(
-            "{SECURITY_PATCH_PROP} changed while the update was prepared; refusing to overwrite it"
-        );
+        bail!("{property} changed while the update was prepared; refusing to overwrite it");
     }
 
-    let write_error = match writer(SECURITY_PATCH_PROP, desired) {
+    let write_error = match writer(property, desired) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
-    let actual = reader(SECURITY_PATCH_PROP);
+    let actual = reader(property);
     if actual.as_deref() == Some(desired) {
         log::warn!("security patch writer returned an error, but the desired value was verified");
         return Ok(());
@@ -377,8 +561,8 @@ where
             .context("security patch write failed and property disappeared; rollback skipped");
     }
 
-    let rollback_error = writer(SECURITY_PATCH_PROP, previous).err();
-    let actual = reader(SECURITY_PATCH_PROP);
+    let rollback_error = writer(property, previous).err();
+    let actual = reader(property);
     if actual.as_deref() == Some(previous) {
         return Err(write_error).context("security patch write failed; previous state restored");
     }
@@ -455,6 +639,7 @@ impl TrustValueSource {
             self,
             TrustValueSource::Computed
                 | TrustValueSource::Original
+                | TrustValueSource::Remote
                 | TrustValueSource::RandomExplicit
                 | TrustValueSource::RandomFallback
         )
@@ -1098,6 +1283,7 @@ mod tests {
             Some("2025-10-05"),
             Some("2025-12-01"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(resolved.security_patch, "2025-12-01");
@@ -1115,6 +1301,7 @@ mod tests {
             Some("raw-vendor"),
             Some("raw-boot"),
             Some("raw-security"),
+            None,
             None,
         )
         .unwrap();
@@ -1140,6 +1327,7 @@ mod tests {
             None,
             Some("2025-12-01"),
             Some("2026-07-05"),
+            None,
         )
         .unwrap();
         assert_eq!(resolved.security_patch, "2026-04-05");
@@ -1159,8 +1347,16 @@ mod tests {
             security_patch: "2026-04-05".to_string(),
             ..Default::default()
         };
-        let resolved =
-            resolve_patch_levels_from(&trust, Some("2025-12-01"), None, None, None, None).unwrap();
+        let resolved = resolve_patch_levels_from(
+            &trust,
+            Some("2025-12-01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(resolved.security_patch, "2026-04-05");
         assert!(resolved.observed_security_patch.is_none());
         assert!(!resolved.write_security_patch);
@@ -1182,12 +1378,13 @@ ro.vendor.boot_security_patch.extra = ignored
     #[test]
     fn security_patch_write_accepts_a_verified_lost_ack() {
         let state = std::cell::RefCell::new(Some("2025-12-01".to_string()));
-        let result = write_security_patch_with_rollback(
+        let result = write_prop_with_rollback(
             |_, desired| {
                 *state.borrow_mut() = Some(desired.to_string());
                 Err(anyhow!("lost acknowledgment"))
             },
             |_| state.borrow().clone(),
+            SECURITY_PATCH_PROP,
             "2026-07-05",
             Some("2025-12-01"),
         );
@@ -1198,12 +1395,13 @@ ro.vendor.boot_security_patch.extra = ignored
     #[test]
     fn security_patch_write_refuses_to_create_a_missing_property() {
         let writes = std::cell::Cell::new(0);
-        let result = write_security_patch_with_rollback(
+        let result = write_prop_with_rollback(
             |_, _| {
                 writes.set(writes.get() + 1);
                 Ok(())
             },
             |_| None,
+            SECURITY_PATCH_PROP,
             "2026-07-05",
             Some("2025-12-01"),
         );
@@ -1215,6 +1413,7 @@ ro.vendor.boot_security_patch.extra = ignored
     fn random_sources_still_require_sysprop_writeback() {
         assert!(TrustValueSource::RandomExplicit.needs_sysprop_write());
         assert!(TrustValueSource::RandomFallback.needs_sysprop_write());
+        assert!(TrustValueSource::Remote.needs_sysprop_write());
         assert!(!TrustValueSource::ExplicitHex.needs_sysprop_write());
         assert!(!TrustValueSource::Property.needs_sysprop_write());
     }
