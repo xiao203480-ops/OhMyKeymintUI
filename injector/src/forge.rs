@@ -154,7 +154,12 @@ fn param(tag: Tag, value: KeyParameterValue) -> KeyParameter {
     KeyParameter { tag, value }
 }
 
-fn generate_params(application_id: &[u8], challenge: &[u8], serial: u64, subject: &str) -> Vec<KeyParameter> {
+fn generate_params(
+    application_id: &[u8],
+    challenge: &[u8],
+    serial: u64,
+    subject: &str,
+) -> Vec<KeyParameter> {
     let mut serial_bytes = serial.to_be_bytes().to_vec();
     while serial_bytes.len() > 1 && serial_bytes[0] == 0 {
         serial_bytes.remove(0);
@@ -163,11 +168,11 @@ fn generate_params(application_id: &[u8], challenge: &[u8], serial: u64, subject
         param(Tag::ALGORITHM, KeyParameterValue::Algorithm(Algorithm::EC)),
         param(Tag::EC_CURVE, KeyParameterValue::EcCurve(EcCurve::P_256)),
         param(Tag::KEY_SIZE, KeyParameterValue::Integer(256)),
-        param(Tag::PURPOSE, KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)),
         param(
-            Tag::DIGEST,
-            KeyParameterValue::Digest(Digest::SHA_2_256),
+            Tag::PURPOSE,
+            KeyParameterValue::KeyPurpose(KeyPurpose::SIGN),
         ),
+        param(Tag::DIGEST, KeyParameterValue::Digest(Digest::SHA_2_256)),
         param(
             Tag::CERTIFICATE_SERIAL,
             KeyParameterValue::Blob(serial_bytes),
@@ -245,7 +250,10 @@ fn forge(
     }
 
     for certificate in created.certificateChain.iter() {
-        response.push_str(&format!("chain={}\n", hex_encode(certificate)));
+        response.push_str(&format!(
+            "chain={}\n",
+            hex_encode(&certificate.encodedCertificate)
+        ));
     }
     Ok(response)
 }
