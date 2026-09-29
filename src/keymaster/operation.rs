@@ -239,7 +239,7 @@ impl RemoteOperationParams {
                         block_mode = Some(block_mode_name(value));
                     }
                 }
-                Tag::ENCRYPTION_PADDING => {
+                Tag::PADDING => {
                     if let KeyParameterValue::PaddingMode(value) = param.value {
                         padding = Some(padding_name(value));
                     }

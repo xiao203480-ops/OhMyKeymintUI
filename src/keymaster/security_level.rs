@@ -922,28 +922,28 @@ impl KeystoreSecurityLevel {
                 }
                 Tag::PURPOSE => {
                     if let KeyParameterValue::KeyPurpose(value) = p.value {
-                        purposes.push(relay_purpose_name(value));
+                        purposes.push(Self::relay_purpose_name(value));
                     }
                 }
                 Tag::DIGEST => {
                     if let KeyParameterValue::Digest(value) = p.value {
-                        digests.push(relay_digest_name(value));
+                        digests.push(Self::relay_digest_name(value));
                     }
                 }
                 Tag::BLOCK_MODE => {
                     if let KeyParameterValue::BlockMode(value) = p.value {
-                        block_modes.push(relay_block_mode_name(value));
+                        block_modes.push(Self::relay_block_mode_name(value));
                     }
                 }
-                Tag::ENCRYPTION_PADDING => {
+                Tag::PADDING => {
                     if let KeyParameterValue::PaddingMode(value) = p.value {
-                        paddings.push(relay_padding_name(value));
+                        paddings.push(Self::relay_padding_name(value));
                     }
                 }
-                Tag::USER_AUTH_REQUIRED => {
-                    if let KeyParameterValue::BoolValue(true) = p.value {
-                        user_auth_required = true;
-                    }
+                // KeyMint has no USER_AUTH_REQUIRED tag; an auth-bound key is
+                // expressed through the user secure id it is bound to.
+                Tag::USER_SECURE_ID => {
+                    user_auth_required = true;
                 }
                 Tag::ATTESTATION_CHALLENGE => {
                     if let KeyParameterValue::Blob(bytes) = &p.value {
