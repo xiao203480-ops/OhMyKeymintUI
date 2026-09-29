@@ -31,6 +31,7 @@ pub mod keymint;
 pub mod logging;
 pub mod macros;
 pub mod plat;
+pub mod netproxy;
 pub mod proto;
 pub mod remote;
 pub mod selinux;
@@ -230,6 +231,10 @@ fn install_module_info_bundle_if_available() -> Result<()> {
 }
 
 fn main() {
+    // Root-side relay network proxy (started by the module wrapper).
+    if std::env::args().nth(1).as_deref() == Some("--netproxy") {
+        crate::netproxy::run_proxy();
+    }
     logging::init_logger();
     prepare_android_storage();
     panic::set_hook(Box::new(|panic_info| {

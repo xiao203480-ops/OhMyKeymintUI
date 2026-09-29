@@ -60,6 +60,13 @@ while true; do
 
   chmod 0755 "$TARGET"
 
+  # Root-side relay network proxy: keystore-uid sockets are routed to the
+  # empty local-network table on some platforms, so the proxy performs the
+  # relay HTTP calls on the daemon's behalf through a file mailbox.
+  mkdir -p /data/misc/keystore/omk/netmail
+  "$TARGET" --netproxy >/dev/null 2>&1 &
+  proxy_pid=$!
+
   "$TARGET" "$@" &
   child_pid=$!
 
@@ -67,9 +74,13 @@ while true; do
     if consume_restart_request; then
       echo "[keymint-daemon] restart requested"
       kill -TERM "$child_pid" 2>/dev/null
+      kill -TERM "$proxy_pid" 2>/dev/null
       sleep 2
       if kill -0 "$child_pid" 2>/dev/null; then
         kill -KILL "$child_pid" 2>/dev/null
+      fi
+      if kill -0 "$proxy_pid" 2>/dev/null; then
+        kill -KILL "$proxy_pid" 2>/dev/null
       fi
       break
     fi
@@ -78,6 +89,7 @@ while true; do
 
   wait "$child_pid"
   rc=$?
+  kill -TERM "$proxy_pid" 2>/dev/null
   echo "[keymint-daemon] keymint exited with code $rc"
   sleep 2
 done

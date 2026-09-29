@@ -75,7 +75,7 @@ fn parse_base_url(server: &str) -> Result<(&str, u16, &str)> {
     Ok((host, port, path.trim_end_matches('/')))
 }
 
-fn http_request(
+pub(crate) fn http_request_raw(
     server: &str,
     method: &str,
     path_and_query: &str,
@@ -151,6 +151,22 @@ pub fn chain_from_response(data: &Value) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Route one relay call: through the root proxy mailbox when it exists
+/// (required on platforms that put keystore sockets on the empty
+/// local-network table), otherwise straight from this process.
+fn relay_request(
+    server: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<(u16, Value)> {
+    if crate::netproxy::mailbox_available() {
+        return crate::netproxy::request(server, method, path_and_query, body, timeout);
+    }
+    http_request_raw(server, method, path_and_query, body, timeout)
+}
+
 /// Submit one task and wait for the worker's result.
 pub fn execute(
     server: &str,
@@ -161,7 +177,7 @@ pub fn execute(
     poll_interval_ms: u64,
 ) -> Result<Value, RemoteErrorKind> {
     let submit_body = json!({"token": token, "op": op, "params": params});
-    let (code, submit_reply) = http_request(
+    let (code, submit_reply) = relay_request(
         server,
         "POST",
         "/relay/submit",
@@ -184,7 +200,7 @@ pub fn execute(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let query = format!("/relay/result?task={task_id}&token={token}");
     while Instant::now() < deadline {
-        let (code, reply) = http_request(
+        let (code, reply) = relay_request(
             server,
             "GET",
             &query,
