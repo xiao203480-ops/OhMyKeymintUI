@@ -399,7 +399,7 @@ impl KeyMintDevice {
                     // Such a key can never be used again, so it is replaced below instead of
                     // failing the request, which for the boot-level key would keep the whole
                     // daemon from starting.
-                    Err(error) if is_unreadable_key_blob(&error) => {
+                    Err(error) if Self::is_unreadable_key_blob(&error) => {
                         warn!(
                             "existing key blob cannot be read at the current boot state; replacing it: {error:#}"
                         );
