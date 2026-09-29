@@ -2474,10 +2474,12 @@ impl KeystoreDB {
                 metadata.add(KeyMetaEntry::RemoteChain(chain.to_vec()));
                 metadata
                     .store_in_db(key_id, tx)
-                    .context(ks_err!("While storing remote-bound key metadata."))
+                    .context(ks_err!("While storing remote-bound key metadata."))?;
+                Ok((false, ()))
             },
         )
-        .context(ks_err!("While marking key as remote-bound."))
+        .context(ks_err!("While marking key as remote-bound."))?;
+        Ok(())
     }
 
     // Helper function loading the key_id given the key descriptor

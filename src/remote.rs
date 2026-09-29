@@ -196,7 +196,7 @@ pub fn execute(
             }
             let message = result
                 .get("error")
-                .get("message")
+                .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown worker error")
                 .to_string();

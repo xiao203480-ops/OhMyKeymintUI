@@ -16,7 +16,8 @@
 
 use crate::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey,
-    HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
+    EcCurve::EcCurve, HardwareAuthenticatorType::HardwareAuthenticatorType,
+    IKeyMintDevice::IKeyMintDevice,
     KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyOrigin::KeyOrigin, KeyParameter::KeyParameter,
     KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
@@ -819,24 +820,24 @@ impl KeystoreSecurityLevel {
         for p in params {
             match p.tag {
                 Tag::ALGORITHM => {
-                    if let KeyParameterValue::algorithm(Algorithm::RSA) = p.value {
+                    if let KeyParameterValue::Algorithm(Algorithm::RSA) = p.value {
                         algorithm = "rsa";
-                    } else if let KeyParameterValue::algorithm(Algorithm::EC) = p.value {
+                    } else if let KeyParameterValue::Algorithm(Algorithm::EC) = p.value {
                         algorithm = "ec";
                     }
                 }
                 Tag::KEY_SIZE => {
-                    if let KeyParameterValue::integer(size) = p.value {
+                    if let KeyParameterValue::Integer(size) = p.value {
                         key_size = size as u64;
                     }
                 }
                 Tag::EC_CURVE => {
-                    if let KeyParameterValue::ecCurve(EcCurve::P_256) = p.value {
+                    if let KeyParameterValue::EcCurve(EcCurve::P_256) = p.value {
                         ec_curve = "p256";
                     }
                 }
                 Tag::ATTESTATION_CHALLENGE => {
-                    if let KeyParameterValue::blob(bytes) = &p.value {
+                    if let KeyParameterValue::Blob(bytes) = &p.value {
                         challenge_b64 = Some(B64.encode(bytes));
                     }
                 }
