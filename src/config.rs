@@ -555,6 +555,7 @@ pub struct Config {
     pub crypto: CryptoConfig,
     pub trust: ResolvedTrust,
     pub device: DeviceProperty,
+    pub remote: RemoteConfig,
     trust_intent: RawTrustConfig,
 }
 
@@ -565,6 +566,7 @@ impl Config {
             crypto: config_file.crypto.clone(),
             trust: resolved_trust,
             device: config_file.device.clone(),
+            remote: config_file.remote.clone(),
             trust_intent: config_file.trust.clone(),
         }
     }
@@ -577,6 +579,10 @@ pub struct ConfigFile {
     pub crypto: CryptoConfig,
     pub trust: RawTrustConfig,
     pub device: DeviceProperty,
+    /// V1 relay remote backend. Absent in existing config files, so it
+    /// defaults to disabled.
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 impl Default for ConfigFile {
@@ -587,6 +593,37 @@ impl Default for ConfigFile {
             crypto: CryptoConfig::default(),
             trust: RawTrustConfig::default(),
             device: DeviceProperty::default(),
+            remote: RemoteConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the V1 remote-keystore relay backend. When enabled,
+/// OMK routes key generation and signing of RemoteBound keys through the
+/// relay server to a stock (unrooted) device's real TEE.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// Master switch. When false, all keys are handled locally by OMK.
+    pub enabled: bool,
+    /// Relay server base URL, e.g. "http://203.0.113.10:8080".
+    pub server: String,
+    /// Shared relay token (must match the server's --token).
+    pub token: String,
+    /// Per-task wait timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Poll interval while waiting for a worker in milliseconds.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server: "http://127.0.0.1:8080".to_string(),
+            token: "attest-poc-demo".to_string(),
+            timeout_ms: 30_000,
+            poll_interval_ms: 1_000,
         }
     }
 }

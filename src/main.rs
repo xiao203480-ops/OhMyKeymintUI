@@ -32,6 +32,7 @@ pub mod logging;
 pub mod macros;
 pub mod plat;
 pub mod proto;
+pub mod remote;
 pub mod selinux;
 pub mod utils;
 pub mod watchdog;
