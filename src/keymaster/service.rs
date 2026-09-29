@@ -347,7 +347,6 @@ impl KeystoreService {
 
         // V1 relay: for RemoteBound keys present the genuine remote
         // attestation chain (fresh fetch, cached fallback).
-        let mut remote_leaf_override: Option<Vec<u8>> = None;
         let remote_chain_override: Option<Vec<u8>> = {
             let cfg = crate::config::config().read().ok();
             let bound_alias = key_entry.metadata().remote_bound().cloned();
@@ -363,11 +362,8 @@ impl KeystoreService {
                         cfg.remote.poll_interval_ms,
                     ) {
                         Ok(data) => {
-                            let parts = crate::remote::chain_parts_from_response(&data);
-                            if let Some(parts) = &parts {
-                                remote_leaf_override = parts.first().cloned();
-                            }
-                            parts.map(|parts| parts.concat())
+                            crate::remote::chain_parts_from_response(&data)
+                                .map(|parts| parts.concat())
                         }
                         Err(error) => {
                             log::warn!("event=route remote get_chain failed: {error}; using cached chain");
@@ -387,7 +383,13 @@ impl KeystoreService {
                     ..Default::default()
                 },
                 keySecurityLevel: self.uuid_to_sec_level(key_entry.km_uuid()),
-                certificate: remote_leaf_override.or_else(|| key_entry.take_cert()),
+                // Remote chains already start with the stock device leaf;
+                // keep `certificate` empty for them so clients that combine
+                // both fields do not duplicate the leaf.
+                certificate: match &remote_chain_override {
+                    Some(_) => None,
+                    None => key_entry.take_cert(),
+                },
                 certificateChain: remote_chain_override.or_else(|| key_entry.take_cert_chain()),
                 modificationTimeMs: key_entry
                     .metadata()
