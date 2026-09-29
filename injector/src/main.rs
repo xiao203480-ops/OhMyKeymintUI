@@ -5,6 +5,7 @@ use nix::unistd::Pid;
 
 pub mod config;
 pub mod filter;
+pub mod forge;
 pub mod forward;
 pub mod hook;
 pub mod identify;
@@ -114,5 +115,6 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
         return false;
     }
     hook::init_hook().expect("failed to initialize binder ioctl hook");
+    forge::start();
     true
 }
