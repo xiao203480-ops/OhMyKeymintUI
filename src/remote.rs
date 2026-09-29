@@ -416,6 +416,9 @@ fn store_device_profile(profile: &RemoteDeviceProfile) {
         "fingerprint": profile.fingerprint,
     });
     let _ = std::fs::write(PROFILE_CACHE_FILE, raw.to_string());
+    // Persistent state under the keystore directory belongs to the keystore
+    // uid, like every other file in /data/misc/keystore/omk/data.
+    crate::netproxy::fix_owner(std::path::Path::new(PROFILE_CACHE_FILE), 0o600);
 }
 
 fn load_cached_device_profile_file() -> Option<RemoteDeviceProfile> {

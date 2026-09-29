@@ -37,7 +37,7 @@ pub fn mailbox_available() -> bool {
     mailbox_dir().is_dir()
 }
 
-fn fix_owner(path: &Path, mode: libc::mode_t) {
+pub(crate) fn fix_owner(path: &Path, mode: libc::mode_t) {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
