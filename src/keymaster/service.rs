@@ -345,6 +345,32 @@ impl KeystoreService {
             None
         };
 
+        // V1 relay: for RemoteBound keys present the genuine remote
+        // attestation chain (fresh fetch, cached fallback).
+        let remote_chain_override: Option<Vec<u8>> = {
+            let cfg = crate::config::config().read().ok();
+            let bound_alias = key_entry.metadata().remote_bound().cloned();
+            match (cfg, bound_alias) {
+                (Some(cfg), Some(alias_bytes)) if cfg.remote.enabled => {
+                    let alias = String::from_utf8(alias_bytes).unwrap_or_default();
+                    match crate::remote::execute(
+                        &cfg.remote.server,
+                        &cfg.remote.token,
+                        crate::remote::OP_GET_CHAIN,
+                        serde_json::json!({ "alias": alias }),
+                        cfg.remote.timeout_ms,
+                        cfg.remote.poll_interval_ms,
+                    ) {
+                        Ok(data) => crate::remote::chain_from_response(&data),
+                        Err(error) => {
+                            log::warn!("event=route remote get_chain failed: {error}; using cached chain");
+                            key_entry.metadata().remote_chain().cloned()
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
         Ok(KeyEntryResponse {
             iSecurityLevel: i_sec_level,
             metadata: KeyMetadata {
@@ -355,7 +381,7 @@ impl KeystoreService {
                 },
                 keySecurityLevel: self.uuid_to_sec_level(key_entry.km_uuid()),
                 certificate: key_entry.take_cert(),
-                certificateChain: key_entry.take_cert_chain(),
+                certificateChain: remote_chain_override.or_else(|| key_entry.take_cert_chain()),
                 modificationTimeMs: key_entry
                     .metadata()
                     .creation_date()
@@ -544,6 +570,24 @@ impl KeystoreService {
             .unwrap()
             .get_credential_encrypted_key_by_user_id(caller_uid.owning_user());
 
+        // V1 relay: best-effort remote delete for RemoteBound keys.
+        if let Ok(cfg) = crate::config::config().read() {
+            if cfg.remote.enabled {
+                if let Some(ref alias) = key.alias {
+                    match crate::remote::execute(
+                        &cfg.remote.server,
+                        &cfg.remote.token,
+                        crate::remote::OP_DELETE,
+                        serde_json::json!({ "alias": alias }),
+                        cfg.remote.timeout_ms,
+                        cfg.remote.poll_interval_ms,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => log::warn!("event=route remote delete failed: {error}"),
+                    }
+                }
+            }
+        }
         DB.with(|db| {
             db.borrow_mut()
                 .unbind_key(key, KeyType::Client, caller_uid, |k, av| {

@@ -147,6 +147,12 @@ impl_metadata!(
         Sec1PublicKey(Vec<u8>) with accessor sec1_public_key,
         /// Keybox identity prefix used to produce this entry's device attestation chain.
         KeyboxAttestationUuidPrefix(Vec<u8>) with accessor keybox_attestation_uuid_prefix,
+        /// Marks a client key whose private material lives on a remote (stock)
+        /// device's TEE via the V1 relay. Payload: the remote alias bytes.
+        RemoteBound(Vec<u8>) with accessor remote_bound,
+        /// Cached attestation chain (concatenated DER) obtained from the
+        /// remote device through the V1 relay.
+        RemoteChain(Vec<u8>) with accessor remote_chain,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
@@ -2450,6 +2456,28 @@ impl KeystoreDB {
             Ok(key_id).do_gc(need_gc)
         })
         .context(ks_err!())
+    }
+
+    /// Mark a Client key as remote-bound (V1 relay) and cache the genuine
+    /// attestation chain obtained from the stock device.
+    pub fn store_remote_bound_metadata(
+        &mut self,
+        key_id: i64,
+        remote_alias: &str,
+        chain: &[u8],
+    ) -> Result<()> {
+        self.with_transaction(
+            Immediate("TX_store_remote_bound_metadata"),
+            |tx| {
+                let mut metadata = KeyMetaData::default();
+                metadata.add(KeyMetaEntry::RemoteBound(remote_alias.as_bytes().to_vec()));
+                metadata.add(KeyMetaEntry::RemoteChain(chain.to_vec()));
+                metadata
+                    .store_in_db(key_id, tx)
+                    .context(ks_err!("While storing remote-bound key metadata."))
+            },
+        )
+        .context(ks_err!("While marking key as remote-bound."))
     }
 
     // Helper function loading the key_id given the key descriptor

@@ -487,6 +487,39 @@ impl KeystoreSecurityLevel {
             }
         };
 
+        // V1 relay: RemoteBound keys sign on the stock device's TEE.
+        let remote_bound_alias: Option<String> = if key.domain != Domain::BLOB {
+            DB.with::<_, Result<Option<String>>>(|db| {
+                let mut db = db.borrow_mut();
+                let (_, entry) = db.load_key_entry(
+                    key,
+                    KeyType::Client,
+                    KeyEntryLoadBits::PUBLIC,
+                    caller_uid,
+                    |k, av| check_key_permission(KeyPerm::Use, k, av.as_ref(), ctx),
+                )?;
+                Ok(entry
+                    .metadata()
+                    .remote_bound()
+                    .and_then(|alias| String::from_utf8(alias.clone()).ok()))
+            })
+            .unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(ref alias) = remote_bound_alias {
+            if let Ok(cfg) = crate::config::config().read() {
+                if cfg.remote.enabled {
+                    operation.set_remote_signing(alias.clone());
+                    log::info!(
+                        "event=route operation remote-bound alias={} uid={}",
+                        alias,
+                        caller_uid.0,
+                    );
+                }
+            }
+        }
+
         let op_binder: binder::Strong<dyn IKeystoreOperation> =
             KeystoreOperation::new_native_binder(operation)
                 .as_binder()
@@ -753,6 +786,115 @@ impl KeystoreSecurityLevel {
                 5000,
             );
             self.keymint.generateKey(&swapped_params, attest_key)
+        })
+    }
+
+    /// V1 relay path: create the key on the stock device's genuine TEE via
+    /// the relay server, then store a local RemoteBound entry (local key
+    /// material kept only as the keystore backing record) and hand the
+    /// client the genuine remote attestation chain.
+    fn generate_key_remote(
+        &self,
+        ctx: Option<&CallerInfo>,
+        key: &KeyDescriptor,
+        attestation_key: Option<&KeyDescriptor>,
+        params: &[KeyParameter],
+        flags: i32,
+        entropy: &[u8],
+    ) -> Result<KeyMetadata, crate::remote::RemoteErrorKind> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        let rc = crate::config::config()
+            .read()
+            .map(|cfg| cfg.remote.clone())
+            .map_err(|_| crate::remote::RemoteErrorKind::Protocol("config lock".into()))?;
+        // 1) remote alias: reuse the local alias, or synthesize a stable one.
+        let alias = key.alias.clone().unwrap_or_else(|| {
+            format!("omk-remote-{}", caller_uid(ctx).0)
+        });
+        // 2) map the keystore key parameters onto the relay task schema.
+        let mut algorithm = "ec";
+        let mut key_size = 256u64;
+        let mut ec_curve = "p256";
+        let mut challenge_b64: Option<String> = None;
+        for p in params {
+            match p.tag {
+                Tag::ALGORITHM => {
+                    if let KeyParameterValue::algorithm(Algorithm::RSA) = p.value {
+                        algorithm = "rsa";
+                    } else if let KeyParameterValue::algorithm(Algorithm::EC) = p.value {
+                        algorithm = "ec";
+                    }
+                }
+                Tag::KEY_SIZE => {
+                    if let KeyParameterValue::integer(size) = p.value {
+                        key_size = size as u64;
+                    }
+                }
+                Tag::EC_CURVE => {
+                    if let KeyParameterValue::ecCurve(EcCurve::P_256) = p.value {
+                        ec_curve = "p256";
+                    }
+                }
+                Tag::ATTESTATION_CHALLENGE => {
+                    if let KeyParameterValue::blob(bytes) = &p.value {
+                        challenge_b64 = Some(B64.encode(bytes));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let task_params = serde_json::json!({
+            "alias": alias,
+            "algorithm": algorithm,
+            "purposes": ["sign"],
+            "digests": ["sha256"],
+            "keySize": key_size,
+            "ecCurve": ec_curve,
+            "attestChallengeB64": challenge_b64,
+        });
+        // 3) remote generate + fetch the genuine chain.
+        let _ = crate::remote::execute(
+            &rc.server,
+            &rc.token,
+            crate::remote::OP_GENERATE_KEY,
+            task_params,
+            rc.timeout_ms,
+            rc.poll_interval_ms,
+        )?;
+        let chain_data = crate::remote::execute(
+            &rc.server,
+            &rc.token,
+            crate::remote::OP_GET_CHAIN,
+            serde_json::json!({ "alias": alias }),
+            rc.timeout_ms,
+            rc.poll_interval_ms,
+        )?;
+        let remote_chain = crate::remote::chain_from_response(&chain_data).ok_or_else(|| {
+            crate::remote::RemoteErrorKind::Protocol("get_chain returned no chain".into())
+        })?;
+        let remote_alias = alias.clone();
+        // 4) local backing entry (permissions/counts/characteristics).
+        let metadata = self
+            .generate_key(ctx, key, attestation_key, params, flags, entropy)
+            .map_err(|status| crate::remote::RemoteErrorKind::WorkerError(status.to_string()))?;
+        // 5) mark RemoteBound and cache the genuine chain.
+        let key_id = metadata.key.nspace;
+        let chain_for_db = remote_chain.clone();
+        crate::global::DB
+            .with(|db| {
+                db.borrow_mut().store_remote_bound_metadata(
+                    key_id,
+                    &remote_alias,
+                    &chain_for_db,
+                )
+            })
+            .map_err(|error| {
+                crate::remote::RemoteErrorKind::Protocol(format!("db metadata: {error}"))
+            })?;
+        // 6) present the genuine remote chain to the client.
+        Ok(KeyMetadata {
+            certificateChain: Some(remote_chain),
+            ..metadata
         })
     }
 
@@ -1402,6 +1544,28 @@ impl IOhMySecurityLevel for OmkSecurityLevelWrapper {
         let ctx = Some(require_omk_ctx(ctx, "IOhMySecurityLevel::generateKey")?);
         let _wp = self.watch_millis("IOhMySecurityLevel::generateKey", 5000);
         security_level_manager::notify_operation_performed(self.security_level);
+        // V1 relay remote backend: when enabled, create the key on the
+        // stock (unrooted) device's genuine TEE via the relay server and
+        // present its real attestation chain. Unavailable fallbacks to the
+        // local OMK backend; worker business errors are authoritative.
+        let remote_enabled = crate::config::config()
+            .read()
+            .map(|cfg| cfg.remote.enabled)
+            .unwrap_or(false);
+        if remote_enabled {
+            match self.generate_key_remote(ctx, key, attestation_key, params, flags, entropy) {
+                Ok(metadata) => return Ok(metadata),
+                Err(crate::remote::RemoteErrorKind::Unavailable) => {
+                    log::warn!("event=route remote generate unavailable; falling back to local OMK");
+                }
+                Err(other) => {
+                    log::warn!("event=route remote generate failed: {other}");
+                    return Err(into_logged_binder(error::Error::Km(
+                        ErrorCode::UNKNOWN_ERROR,
+                    )));
+                }
+            }
+        }
         let (latency, result) = crate::timed_call!(self.generate_key(
             ctx,
             key,

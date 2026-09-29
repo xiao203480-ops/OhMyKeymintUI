@@ -401,6 +401,36 @@ fields.
 The MEID used by devices that provide one. Many devices have no MEID, so an
 empty value is valid. Its absence does not invalidate an available IMEI.
 
+### `[remote]` — V1 relay remote backend (default disabled)
+
+When enabled, OMK routes key generation to the V1 relay: the key is created
+on a stock (unrooted) device's genuine TEE via the relay server, and the
+client receives its real attestation chain. RemoteBound keys sign through
+the relay as well; local key material exists only as the keystore backing
+record.
+
+```toml
+[remote]
+enabled = false
+server = "http://127.0.0.1:8080"
+token = "attest-poc-demo"
+timeout_ms = 30000
+poll_interval_ms = 1000
+```
+
+- `enabled`: master switch. Keep `false` for normal use.
+- `server`: relay server base URL (`http://host:port`; plain HTTP for the
+  validation phase, TLS is a later hardening item).
+- `token`: shared relay token, must match the server's `--token`.
+- `timeout_ms`: per-task wait budget before the backend is treated as
+  OMK-unavailable.
+- `poll_interval_ms`: interval between result polls while waiting.
+
+Failure semantics follow the OMK routing invariants: an unavailable relay
+falls back to the local OMK backend for generation, while worker business
+errors are returned to the caller; the relay never produces a successful
+reply on failure.
+
 ### `config.toml` apply summary
 
 | Fields | Required action |

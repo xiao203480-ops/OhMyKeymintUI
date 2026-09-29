@@ -15,6 +15,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
 use serde_json::{json, Value};
 
 /// Task operations understood by the stock worker.
@@ -130,6 +131,19 @@ Connection: close
         .ok_or_else(|| anyhow!("relay response has no status code"))?;
     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     Ok((code, parsed))
+}
+
+/// Convert a relay get_chain response into concatenated DER bytes
+/// (the keystore certificateChain wire format).
+pub fn chain_from_response(data: &Value) -> Option<Vec<u8>> {
+    let arr = data.get("chain")?.as_array()?;
+    let mut out = Vec::new();
+    for value in arr {
+        let b64 = value.as_str()?;
+        let der = B64.decode(b64).ok()?;
+        out.extend_from_slice(&der);
+    }
+    Some(out)
 }
 
 /// Submit one task and wait for the worker's result.

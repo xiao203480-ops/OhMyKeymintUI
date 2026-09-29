@@ -180,6 +180,14 @@ pub enum Outcome {
 /// Operation bundles all of the operation related resources and tracks the operation's
 /// outcome.
 #[derive(Debug)]
+/// V1 relay remote signing state: the operation accumulates input data
+/// locally and forwards it to the stock device's TEE at finish.
+#[derive(Debug)]
+struct RemoteSign {
+    alias: String,
+    data: Vec<u8>,
+}
+
 pub struct Operation {
     // The index of this operation in the OperationDb.
     index: usize,
@@ -191,6 +199,8 @@ pub struct Operation {
     forced: bool,
     logging_info: LoggingInfo,
     operation_metrics: Mutex<OperationMetrics>,
+    // Present only for RemoteBound keys (V1 relay).
+    remote: Option<Mutex<RemoteSign>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -262,7 +272,16 @@ impl Operation {
             forced,
             logging_info,
             operation_metrics: Mutex::new(OperationMetrics::default()),
+            remote: None,
         }
+    }
+
+    /// Enable V1 relay remote signing for this operation (RemoteBound key).
+    pub fn set_remote_signing(&mut self, alias: String) {
+        self.remote = Some(Mutex::new(RemoteSign {
+            alias,
+            data: Vec::new(),
+        }));
     }
 
     fn watch(&self, id: &'static str) -> Option<wd::WatchPoint> {
@@ -411,6 +430,14 @@ impl Operation {
         let mut outcome = self.check_active().context("In update")?;
         Self::check_input_length(input).context("In update")?;
         self.touch();
+        // V1 relay: accumulate the message for the remote sign at finish.
+        if let Some(remote) = &self.remote {
+            remote
+                .lock()
+                .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))?
+                .data
+                .extend_from_slice(input);
+        }
 
         let (hat, tst) = self
             .auth_info
@@ -448,6 +475,56 @@ impl Operation {
             .unwrap()
             .before_finish()
             .context(ks_err!("Trying to get auth tokens for {:?}", self.owner))?;
+
+        // V1 relay: RemoteBound operations sign on the stock device's TEE.
+        if let Some(remote) = &self.remote {
+            let mut guard = remote
+                .lock()
+                .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))?;
+            if let Some(input) = input {
+                guard.data.extend_from_slice(input);
+            }
+            let rc = crate::config::config()
+                .read()
+                .map(|cfg| cfg.remote.clone())
+                .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))?;
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&guard.data);
+            let result = crate::remote::execute(
+                &rc.server,
+                &rc.token,
+                crate::remote::OP_SIGN,
+                serde_json::json!({
+                    "alias": guard.alias,
+                    "dataB64": data_b64,
+                }),
+                rc.timeout_ms,
+                rc.poll_interval_ms,
+            );
+            drop(guard);
+            match result {
+                Ok(data) => {
+                    let sig_b64 = data
+                        .get("signatureB64")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| Error::Km(ErrorCode::UNKNOWN_ERROR))
+                        .context(ks_err!("Remote finish missing signature"))?;
+                    let signature_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(sig_b64)
+                        .map_err(|_| Error::Km(ErrorCode::UNKNOWN_ERROR))
+                        .context(ks_err!("Remote finish bad signature b64"))?;
+                    *outcome = Outcome::Success;
+                    return Ok(Some(signature_bytes));
+                }
+                Err(crate::remote::RemoteErrorKind::Unavailable) => {
+                    return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
+                        .context(ks_err!("Remote finish unavailable"));
+                }
+                Err(other) => {
+                    return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
+                        .context(ks_err!("Remote finish failed: {other}"));
+                }
+            }
+        }
 
         let output = self
             .update_outcome(&mut outcome, {
