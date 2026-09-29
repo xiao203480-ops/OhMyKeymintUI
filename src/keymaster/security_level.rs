@@ -871,9 +871,11 @@ impl KeystoreSecurityLevel {
             rc.timeout_ms,
             rc.poll_interval_ms,
         )?;
-        let remote_chain = crate::remote::chain_from_response(&chain_data).ok_or_else(|| {
+        let chain_parts = crate::remote::chain_parts_from_response(&chain_data).ok_or_else(|| {
             crate::remote::RemoteErrorKind::Protocol("get_chain returned no chain".into())
         })?;
+        let remote_leaf = chain_parts.first().cloned();
+        let remote_chain: Vec<u8> = chain_parts.concat();
         let remote_alias = alias.clone();
         // 4) local backing entry (permissions/counts/characteristics).
         let metadata = self
@@ -893,8 +895,12 @@ impl KeystoreSecurityLevel {
             .map_err(|error| {
                 crate::remote::RemoteErrorKind::Protocol(format!("db metadata: {error}"))
             })?;
-        // 6) present the genuine remote chain to the client.
+        // 6) present the genuine remote chain to the client. The leaf
+        // certificate must come from the stock device as well, otherwise
+        // clients see the local placeholder certificate first and reject
+        // the chain during signature verification.
         Ok(KeyMetadata {
+            certificate: remote_leaf,
             certificateChain: Some(remote_chain),
             ..metadata
         })

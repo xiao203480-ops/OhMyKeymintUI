@@ -141,12 +141,21 @@ pub(crate) fn http_request_raw(
 /// Convert a relay get_chain response into concatenated DER bytes
 /// (the keystore certificateChain wire format).
 pub fn chain_from_response(data: &Value) -> Option<Vec<u8>> {
+    let parts = chain_parts_from_response(data)?;
+    Some(parts.concat())
+}
+
+/// Certificate chain from a relay get_chain response, as individual DER
+/// certificates (leaf first).
+pub fn chain_parts_from_response(data: &Value) -> Option<Vec<Vec<u8>>> {
     let arr = data.get("chain")?.as_array()?;
     let mut out = Vec::new();
     for value in arr {
         let b64 = value.as_str()?;
-        let der = B64.decode(b64).ok()?;
-        out.extend_from_slice(&der);
+        out.push(B64.decode(b64).ok()?);
+    }
+    if out.is_empty() {
+        return None;
     }
     Some(out)
 }
