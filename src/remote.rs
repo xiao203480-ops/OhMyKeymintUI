@@ -101,8 +101,10 @@ fn http_request(
     );
     if let Some(body) = body {
         let bytes = body.to_string();
-        request.push_str("Content-Type: application/json" + CRLF);
-        request.push_str(&format!("Content-Length: {}" + CRLF, bytes.len()));
+        request.push_str("Content-Type: application/json");
+        request.push_str(CRLF);
+        request.push_str(&format!("Content-Length: {}", bytes.len()));
+        request.push_str(CRLF);
         request.push_str(CRLF);
         request.push_str(&bytes);
     } else {
