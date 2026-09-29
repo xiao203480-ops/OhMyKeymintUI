@@ -28,6 +28,7 @@ const CRLF_LF: &str = "\r\n\r\n";
 /// Task operations understood by the stock worker.
 pub const OP_GENERATE_KEY: &str = "generate_key";
 pub const OP_GET_CHAIN: &str = "get_chain";
+pub const OP_GENERATE_KEY_AND_CHAIN: &str = "generate_key_and_chain";
 pub const OP_SIGN: &str = "sign";
 pub const OP_VERIFY: &str = "verify";
 pub const OP_DELETE: &str = "delete";
@@ -176,8 +177,72 @@ fn relay_request(
     http_request_raw(server, method, path_and_query, body, timeout)
 }
 
+/// Extract the worker's payload from a relay result envelope.
+fn unwrap_result(result: &Value) -> Result<Value, RemoteErrorKind> {
+    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(result.get("data").cloned().unwrap_or(Value::Null));
+    }
+    let message = result
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown worker error")
+        .to_string();
+    Err(RemoteErrorKind::WorkerError(message))
+}
+
 /// Submit one task and wait for the worker's result.
+///
+/// Fast path: a single `/relay/execute` call that submits the task and
+/// long-polls server side, so no client-side result polling is needed.
+/// Falls back to the submit + poll protocol when the server is older.
 pub fn execute(
+    server: &str,
+    token: &str,
+    op: &str,
+    params: Value,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> Result<Value, RemoteErrorKind> {
+    let body = json!({
+        "token": token,
+        "op": op,
+        "params": params.clone(),
+        "waitMs": timeout_ms,
+    });
+    let (code, reply) = relay_request(
+        server,
+        "POST",
+        "/relay/execute",
+        Some(&body),
+        Duration::from_millis(timeout_ms.saturating_add(20_000)),
+    )
+    .map_err(|error| {
+        log::warn!("event=route remote execute transport failed: {error:#}");
+        RemoteErrorKind::Unavailable
+    })?;
+    match code {
+        200 => {
+            let result = reply.get("result").cloned().unwrap_or(Value::Null);
+            unwrap_result(&result)
+        }
+        404 => {
+            log::info!("event=route relay lacks /relay/execute; using submit+poll");
+            execute_legacy(server, token, op, params, timeout_ms, poll_interval_ms)
+        }
+        504 => {
+            log::warn!("event=route remote execute timed out waiting for a worker");
+            Err(RemoteErrorKind::Unavailable)
+        }
+        other => {
+            log::warn!("event=route remote execute rejected with HTTP {other}");
+            Err(RemoteErrorKind::Unavailable)
+        }
+    }
+}
+
+/// Legacy two-step protocol (submit, then poll for the result).
+fn execute_legacy(
     server: &str,
     token: &str,
     op: &str,
@@ -228,16 +293,7 @@ pub fn execute(
         }
         if reply.get("done").and_then(Value::as_bool).unwrap_or(false) {
             let result = reply.get("result").cloned().unwrap_or(Value::Null);
-            if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                return Ok(result.get("data").cloned().unwrap_or(Value::Null));
-            }
-            let message = result
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown worker error")
-                .to_string();
-            return Err(RemoteErrorKind::WorkerError(message));
+            return unwrap_result(&result);
         }
         std::thread::sleep(Duration::from_millis(poll_interval_ms.max(100)));
     }

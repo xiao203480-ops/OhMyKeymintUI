@@ -59,7 +59,7 @@ pub fn run_proxy() -> ! {
     println!("netproxy: serving {}", dir.display());
     loop {
         match serve_once(&dir) {
-            Ok(()) => thread::sleep(Duration::from_millis(120)),
+            Ok(()) => thread::sleep(Duration::from_millis(25)),
             Err(error) => {
                 eprintln!("netproxy: {error:#}");
                 thread::sleep(Duration::from_millis(500));
@@ -175,7 +175,7 @@ pub fn request(
             let _ = fs::remove_file(&request_path);
             bail!("proxy request timed out");
         }
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

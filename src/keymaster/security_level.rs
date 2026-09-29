@@ -854,23 +854,39 @@ impl KeystoreSecurityLevel {
             "ecCurve": ec_curve,
             "attestChallengeB64": challenge_b64,
         });
-        // 3) remote generate + fetch the genuine chain.
-        let _ = crate::remote::execute(
+        // 3) remote generate + fetch the genuine chain in one round trip;
+        // older workers without the combined operation get the two-step
+        // flow as a fallback.
+        let chain_data = match crate::remote::execute(
             &rc.server,
             &rc.token,
-            crate::remote::OP_GENERATE_KEY,
-            task_params,
+            crate::remote::OP_GENERATE_KEY_AND_CHAIN,
+            task_params.clone(),
             rc.timeout_ms,
             rc.poll_interval_ms,
-        )?;
-        let chain_data = crate::remote::execute(
-            &rc.server,
-            &rc.token,
-            crate::remote::OP_GET_CHAIN,
-            serde_json::json!({ "alias": alias }),
-            rc.timeout_ms,
-            rc.poll_interval_ms,
-        )?;
+        ) {
+            Ok(data) => data,
+            Err(crate::remote::RemoteErrorKind::WorkerError(_)) => {
+                log::info!("event=route worker lacks combined op; using two-step flow");
+                let _ = crate::remote::execute(
+                    &rc.server,
+                    &rc.token,
+                    crate::remote::OP_GENERATE_KEY,
+                    task_params,
+                    rc.timeout_ms,
+                    rc.poll_interval_ms,
+                )?;
+                crate::remote::execute(
+                    &rc.server,
+                    &rc.token,
+                    crate::remote::OP_GET_CHAIN,
+                    serde_json::json!({ "alias": alias }),
+                    rc.timeout_ms,
+                    rc.poll_interval_ms,
+                )?
+            }
+            Err(other) => return Err(other),
+        };
         let chain_parts = crate::remote::chain_parts_from_response(&chain_data).ok_or_else(|| {
             crate::remote::RemoteErrorKind::Protocol("get_chain returned no chain".into())
         })?;
