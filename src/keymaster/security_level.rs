@@ -874,7 +874,10 @@ impl KeystoreSecurityLevel {
         let chain_parts = crate::remote::chain_parts_from_response(&chain_data).ok_or_else(|| {
             crate::remote::RemoteErrorKind::Protocol("get_chain returned no chain".into())
         })?;
-        let remote_chain: Vec<u8> = chain_parts.concat();
+        // The client combines `certificate` with `certificateChain`, so the
+        // leaf must live in `certificate` and the remainder in the chain.
+        let remote_leaf = chain_parts.first().cloned();
+        let remote_chain: Vec<u8> = chain_parts.iter().skip(1).flatten().copied().collect();
         let remote_alias = alias.clone();
         // 4) local backing entry (permissions/counts/characteristics).
         let metadata = self
@@ -894,13 +897,15 @@ impl KeystoreSecurityLevel {
             .map_err(|error| {
                 crate::remote::RemoteErrorKind::Protocol(format!("db metadata: {error}"))
             })?;
-        // 6) present the genuine remote chain to the client. The chain
-        // already starts with the stock device's leaf certificate, so the
-        // separate `certificate` field stays empty: clients that combine
-        // both fields would otherwise see the leaf twice.
+        // 6) present the genuine remote chain to the client: the stock
+        // device's leaf certificate plus the remaining issuer chain.
         Ok(KeyMetadata {
-            certificate: None,
-            certificateChain: Some(remote_chain),
+            certificate: remote_leaf,
+            certificateChain: if remote_chain.is_empty() {
+                None
+            } else {
+                Some(remote_chain)
+            },
             ..metadata
         })
     }
