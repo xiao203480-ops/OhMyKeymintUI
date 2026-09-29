@@ -804,6 +804,7 @@ impl KeystoreSecurityLevel {
         entropy: &[u8],
     ) -> Result<KeyMetadata, crate::remote::RemoteErrorKind> {
         use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
         let rc = crate::config::config()
             .read()
             .map(|cfg| cfg.remote.clone())
@@ -1563,7 +1564,8 @@ impl IOhMySecurityLevel for OmkSecurityLevelWrapper {
                     log::warn!("event=route remote generate failed: {other}");
                     return Err(into_logged_binder(error::Error::Km(
                         ErrorCode::UNKNOWN_ERROR,
-                    )));
+                    )
+                    .into()));
                 }
             }
         }

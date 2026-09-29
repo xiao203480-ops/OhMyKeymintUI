@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::{json, Value};
 
 /// Task operations understood by the stock worker.
@@ -163,7 +164,7 @@ pub fn execute(
         Some(&submit_body),
         Duration::from_secs(10),
     )
-    .map_err(|error| RemoteErrorKind::Unavailable)?;
+    .map_err(|_error| RemoteErrorKind::Unavailable)?;
     if code != 200 {
         return Err(RemoteErrorKind::Unavailable);
     }
@@ -182,7 +183,7 @@ pub fn execute(
             None,
             Duration::from_millis(poll_interval_ms.max(500) + 2000),
         )
-        .map_err(|error| RemoteErrorKind::Unavailable)?;
+        .map_err(|_error| RemoteErrorKind::Unavailable)?;
         if code == 404 {
             return Err(RemoteErrorKind::Protocol("task not found on server".to_string()));
         }
