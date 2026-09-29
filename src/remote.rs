@@ -19,6 +19,12 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::{json, Value};
 
+/// CRLF line terminator used on the wire.
+const CRLF: &str = "\r\n";
+
+/// Header/body separator.
+const CRLF_LF: &str = "\r\n\r\n";
+
 /// Task operations understood by the stock worker.
 pub const OP_GENERATE_KEY: &str = "generate_key";
 pub const OP_GET_CHAIN: &str = "get_chain";
@@ -88,24 +94,19 @@ fn http_request(
     stream.set_nodelay(true).context("set nodelay")?;
 
     let full_path = format!("{base_path}{path_and_query}");
+    // The relay server (python http.server based) needs strict CRLF line
+    // endings and is only reliable with HTTP/1.0 + Connection: close.
     let mut request = format!(
-        "{method} {full_path} HTTP/1.1
-Host: {host}:{port}
-Connection: close
-"
+        "{method} {full_path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n"
     );
     if let Some(body) = body {
         let bytes = body.to_string();
-        request.push_str("Content-Type: application/json
-");
-        request.push_str(&format!("Content-Length: {}
-", bytes.len()));
-        request.push_str("
-");
+        request.push_str("Content-Type: application/json" + CRLF);
+        request.push_str(&format!("Content-Length: {}" + CRLF, bytes.len()));
+        request.push_str(CRLF);
         request.push_str(&bytes);
     } else {
-        request.push_str("
-");
+        request.push_str(CRLF);
     }
     stream
         .write_all(request.as_bytes())
@@ -115,11 +116,12 @@ Connection: close
     stream
         .read_to_end(&mut response)
         .context("relay read failed")?;
+    if response.is_empty() {
+        bail!("relay returned an empty response from {host}:{port}");
+    }
     let text = String::from_utf8(response).context("relay response not utf-8")?;
     let (head, body) = text
-        .split_once("
-
-")
+        .split_once(CRLF_LF)
         .ok_or_else(|| anyhow!("relay response has no body separator"))?;
     let status_line = head
         .lines()
@@ -164,8 +166,12 @@ pub fn execute(
         Some(&submit_body),
         Duration::from_secs(10),
     )
-    .map_err(|_error| RemoteErrorKind::Unavailable)?;
+    .map_err(|error| {
+        log::warn!("event=route remote submit transport failed: {error:#}");
+        RemoteErrorKind::Unavailable
+    })?;
     if code != 200 {
+        log::warn!("event=route remote submit rejected with HTTP {code}");
         return Err(RemoteErrorKind::Unavailable);
     }
     let task_id = submit_reply
@@ -183,7 +189,10 @@ pub fn execute(
             None,
             Duration::from_millis(poll_interval_ms.max(500) + 2000),
         )
-        .map_err(|_error| RemoteErrorKind::Unavailable)?;
+        .map_err(|error| {
+            log::warn!("event=route remote poll transport failed: {error:#}");
+            RemoteErrorKind::Unavailable
+        })?;
         if code == 404 {
             return Err(RemoteErrorKind::Protocol("task not found on server".to_string()));
         }
